@@ -561,5 +561,19 @@ END;
 EXEC sys.sp_executesql @ddl;
 
 PRINT 'Trigger deployed: ' + QUOTENAME(@schema) + '.' + QUOTENAME(@trg);
-PRINT 'Join condition used: ' + @join;
+PRINT 'Join condition used
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+SELECT
+  i.name AS index_name, i.is_unique, i.is_primary_key,
+  c.name AS column_name, ic.key_ordinal
+FROM sys.indexes i
+JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id
+JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+WHERE i.object_id = OBJECT_ID('S_cdpdynamcs.CDP_DemographicsV7')
+  AND i.is_hypothetical=0
+  AND ic.is_included_column=0
+ORDER BY i.is_primary_key DESC, i.is_unique DESC, i.name, ic.key_ordinal;
+
 
