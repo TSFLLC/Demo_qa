@@ -250,9 +250,18 @@ GO
 ++++++++++++++++++++++++++++++++++////+++++TRIGGER ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 /*=========================================================
-  Deploy Trigger: mask NEW rows and any future UPDATES
+  INSTEAD OF INSERT Trigger for Static Masking (Insert-only)
   Table: S_cdpdynamcs.CDP_DemographicsV7
+
+  Fixes:
+   - STRING_AGG truncation > 8000 bytes  -> CAST(expr AS NVARCHAR(MAX))
+   - STRING_AGG separator cannot be MAX  -> @sep is NVARCHAR(10)
+
+  Notes:
+   - Excludes identity/computed/rowversion columns from insert list
+   - Masks only columns that exist (auto-detected)
 =========================================================*/
+
 DECLARE @schema sysname = N'S_cdpdynamcs';
 DECLARE @table  sysname = N'CDP_DemographicsV7';
 DECLARE @objId  int = OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@table));
@@ -263,305 +272,199 @@ BEGIN
     RETURN;
 END;
 
-/*=========================================================
-  1) Find best join key (PK -> Unique index -> Identity)
-=========================================================*/
-DECLARE @join nvarchar(max) = N'';
+-- Drop old trigger if exists
+IF OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(N'trg_' + @table + N'_StaticMask_INS'), 'TR') IS NOT NULL
+BEGIN
+    DECLARE @drop nvarchar(max) =
+        N'DROP TRIGGER ' + QUOTENAME(@schema) + N'.' + QUOTENAME(N'trg_' + @table + N'_StaticMask_INS') + N';';
+    EXEC sys.sp_executesql @drop;
+END
 
-;WITH pk AS (
-    SELECT c.name AS col_name, ic.key_ordinal
-    FROM sys.indexes i
-    JOIN sys.index_columns ic
-      ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-    JOIN sys.columns c
-      ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-    WHERE i.object_id = @objId AND i.is_primary_key = 1
+DECLARE @cols nvarchar(max);
+DECLARE @sel  nvarchar(max);
+
+DECLARE @crlf nchar(2) = NCHAR(13) + NCHAR(10);
+DECLARE @sep  nvarchar(10) = N', ' + @crlf;  -- MUST NOT be NVARCHAR(MAX)
+
+/*=========================================================
+  1) Build INSERT column list excluding identity/computed/rowversion
+=========================================================*/
+;WITH c AS (
+    SELECT
+        col.name,
+        col.column_id,
+        col.is_identity,
+        col.is_computed,
+        typ.name AS type_name
+    FROM sys.columns col
+    JOIN sys.types typ
+      ON col.user_type_id = typ.user_type_id
+    WHERE col.object_id = @objId
+      AND col.is_identity = 0
+      AND col.is_computed = 0
+      AND typ.name NOT IN (N'timestamp', N'rowversion')
 )
-SELECT @join =
-    STRING_AGG(N'p.' + QUOTENAME(col_name) + N' = i.' + QUOTENAME(col_name), N' AND ')
-    WITHIN GROUP (ORDER BY key_ordinal)
-FROM pk;
-
-IF NULLIF(@join, N'') IS NULL
-BEGIN
-    ;WITH uq AS (
-        SELECT TOP (1) i.index_id
-        FROM sys.indexes i
-        WHERE i.object_id = @objId
-          AND i.is_unique = 1
-          AND i.is_hypothetical = 0
-          AND i.type_desc IN ('CLUSTERED','NONCLUSTERED')
-        ORDER BY CASE WHEN i.is_unique_constraint = 1 THEN 0 ELSE 1 END, i.index_id
-    ),
-    uqcols AS (
-        SELECT c.name AS col_name, ic.key_ordinal
-        FROM uq
-        JOIN sys.index_columns ic
-          ON ic.object_id = @objId AND ic.index_id = uq.index_id
-        JOIN sys.columns c
-          ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-        WHERE ic.is_included_column = 0
-    )
-    SELECT @join =
-        STRING_AGG(N'p.' + QUOTENAME(col_name) + N' = i.' + QUOTENAME(col_name), N' AND ')
-        WITHIN GROUP (ORDER BY key_ordinal)
-    FROM uqcols;
-END
-
-IF NULLIF(@join, N'') IS NULL
-BEGIN
-    DECLARE @idcol sysname;
-    SELECT TOP (1) @idcol = c.name
-    FROM sys.columns c
-    WHERE c.object_id = @objId
-      AND c.is_identity = 1
-    ORDER BY c.column_id;
-
-    IF @idcol IS NOT NULL
-        SET @join = N'p.' + QUOTENAME(@idcol) + N' = i.' + QUOTENAME(@idcol);
-END
-
-IF NULLIF(@join, N'') IS NULL
-BEGIN
-    RAISERROR(
-        'No PK / Unique Index / Identity column found on %s.%s. To mask on UPDATE safely, add a unique key.',
-        16, 1, @schema, @table
-    );
-    RETURN;
-END;
-
-/*=========================================================
-  2) Detect columns (same logic as your masking script)
-=========================================================*/
-DECLARE
-    @cDOB sysname,
-    @cFN sysname,
-    @cLN sysname,
-    @cSSN sysname,
-    @cMB sysname,
-    @cHP sysname,
-    @cWP sysname,
-    @cMP sysname,
-    @cPE sysname,
-    @cSE sysname,
-    @cRHP sysname,
-    @cRMP sysname,
-    @cREM sysname,
-    @cS1 sysname,
-    @cS2 sysname,
-    @cCity sysname,
-    @cZip sysname;
-
-;WITH c AS (SELECT name FROM sys.columns WHERE object_id = @objId)
 SELECT
-    @cDOB = (SELECT TOP 1 name FROM c WHERE name IN (N'DateofBirth', N'DateOfBirth', N'DOB') OR name LIKE N'%Birth%'),
-    @cFN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientFirstName', N'FirstName') OR name LIKE N'%First%Name%'),
-    @cLN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientLastName',  N'LastName')  OR name LIKE N'%Last%Name%'),
-    @cSSN = (SELECT TOP 1 name FROM c WHERE name IN (N'SSN', N'PatientSSN') OR name LIKE N'%SSN%'),
-    @cMB  = (SELECT TOP 1 name FROM c WHERE name IN (N'MemberNumber', N'MemberNbr', N'Member_ID') OR name LIKE N'%Member%Number%'),
-    @cHP  = (SELECT TOP 1 name FROM c WHERE name IN (N'HomePhone') OR name LIKE N'%Home%Phone%'),
-    @cWP  = (SELECT TOP 1 name FROM c WHERE name IN (N'WorkPhone') OR name LIKE N'%Work%Phone%'),
-    @cMP  = (SELECT TOP 1 name FROM c WHERE name IN (N'MobilePhone', N'CellPhone') OR name LIKE N'%Mobile%Phone%' OR name LIKE N'%Cell%Phone%'),
-    @cPE  = (SELECT TOP 1 name FROM c WHERE name IN (N'Primary Email', N'PrimaryEmail') OR name LIKE N'%Primary%Email%'),
-    @cSE  = (SELECT TOP 1 name FROM c WHERE name IN (N'Secondary Email', N'SecondaryEmail') OR name LIKE N'%Secondary%Email%'),
-    @cRHP = (SELECT TOP 1 name FROM c WHERE name IN (N'HomePhone(relationship)', N'RelationshipHomePhone') OR name LIKE N'%Home%Phone%relationship%'),
-    @cRMP = (SELECT TOP 1 name FROM c WHERE name IN (N'MobilePhone(relationship)', N'RelationshipMobilePhone') OR name LIKE N'%Mobile%Phone%relationship%'),
-    @cREM = (SELECT TOP 1 name FROM c WHERE name IN (N'Email(relationship)', N'RelationshipEmail') OR name LIKE N'%Email%relationship%'),
-    @cS1  = (SELECT TOP 1 name FROM c WHERE name IN (N'Address 1: Street 1', N'Address1Street1') OR name LIKE N'%Address%1%Street%1%'),
-    @cS2  = (SELECT TOP 1 name FROM c WHERE name IN (N'Address 2: Street 2', N'Address2Street2') OR name LIKE N'%Address%2%Street%2%'),
-    @cCity= (SELECT TOP 1 name FROM c WHERE name IN (N'Address 1: City', N'Address1City') OR name LIKE N'%Address%1%City%'),
-    @cZip = (SELECT TOP 1 name FROM c WHERE name IN (N'Address 1: Zip', N'Address1Zip', N'Zip') OR name LIKE N'%Address%1%Zip%');
+    @cols = STRING_AGG(CAST(QUOTENAME(name) AS nvarchar(max)), N', ')
+            WITHIN GROUP (ORDER BY column_id)
+FROM c;
 
 /*=========================================================
-  3) Build SET clause dynamically (only columns that exist)
+  2) Build SELECT list (default i.[col], override masked columns)
+  - Force expr as NVARCHAR(MAX) to avoid 8000 byte truncation
 =========================================================*/
-DECLARE @set nvarchar(max) = N'';
-DECLARE @comma nvarchar(2) = N'';
+;WITH c AS (
+    SELECT
+        col.name,
+        col.column_id,
+        typ.name AS type_name
+    FROM sys.columns col
+    JOIN sys.types typ
+      ON col.user_type_id = typ.user_type_id
+    WHERE col.object_id = @objId
+      AND col.is_identity = 0
+      AND col.is_computed = 0
+      AND typ.name NOT IN (N'timestamp', N'rowversion')
+),
+x AS (
+    SELECT
+        name,
+        column_id,
+        expr = CAST(
+        CASE
+            /* ---- DOB ---- */
+            WHEN name IN (N'DateofBirth', N'DateOfBirth', N'DOB') OR name LIKE N'%Birth%' THEN
+                N'DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + ''_DOB'') AS BIGINT)) % 25550, CONVERT(date,''1940-01-01'')) AS ' + QUOTENAME(name)
 
--- Seed from INSERTED (so same row update is consistent per statement)
-DECLARE @seed nvarchar(max);
-SET @seed = N'NULLIF(LTRIM(RTRIM('
-    + N'COALESCE(CONVERT(varchar(200), ' + CASE WHEN @cMB  IS NOT NULL THEN N'i.' + QUOTENAME(@cMB)  ELSE N'NULL' END + N'), '''') + ''|'' + '
-    + N'COALESCE(CONVERT(varchar(200), ' + CASE WHEN @cSSN IS NOT NULL THEN N'i.' + QUOTENAME(@cSSN) ELSE N'NULL' END + N'), '''') + ''|'' + '
-    + N'COALESCE(CONVERT(varchar(200), ' + CASE WHEN @cPE  IS NOT NULL THEN N'i.' + QUOTENAME(@cPE)  ELSE N'NULL' END + N'), '''') + ''|'' + '
-    + N'COALESCE(CONVERT(varchar(200), ' + CASE WHEN @cFN  IS NOT NULL THEN N'i.' + QUOTENAME(@cFN)  ELSE N'NULL' END + N'), '''') + ''|'' + '
-    + N'COALESCE(CONVERT(varchar(200), ' + CASE WHEN @cLN  IS NOT NULL THEN N'i.' + QUOTENAME(@cLN)  ELSE N'NULL' END + N'), '''') + ''|'' + '
-    + N'COALESCE(CONVERT(varchar(30),  ' + CASE WHEN @cDOB IS NOT NULL THEN N'i.' + QUOTENAME(@cDOB) ELSE N'NULL' END + N', 120), '''')'
-    + N')), '''')';
+            /* ---- FIRST / LAST NAME ---- */
+            WHEN name IN (N'PatientFirstName', N'FirstName') OR name LIKE N'%First%Name%' THEN
+                N'CASE ABS(CAST(CHECKSUM(s.Seed + ''_FN'') AS BIGINT)) % 10
+                     WHEN 0 THEN ''James'' WHEN 1 THEN ''Mary'' WHEN 2 THEN ''John'' WHEN 3 THEN ''Patricia'' WHEN 4 THEN ''Robert''
+                     WHEN 5 THEN ''Linda'' WHEN 6 THEN ''Michael'' WHEN 7 THEN ''Barbara'' WHEN 8 THEN ''David'' WHEN 9 THEN ''Elizabeth''
+                 END AS ' + QUOTENAME(name)
 
-IF @cDOB IS NOT NULL
+            WHEN name IN (N'PatientLastName', N'LastName') OR name LIKE N'%Last%Name%' THEN
+                N'CASE ABS(CAST(CHECKSUM(s.Seed + ''_LN'') AS BIGINT)) % 10
+                     WHEN 0 THEN ''Smith'' WHEN 1 THEN ''Johnson'' WHEN 2 THEN ''Williams'' WHEN 3 THEN ''Brown'' WHEN 4 THEN ''Jones''
+                     WHEN 5 THEN ''Garcia'' WHEN 6 THEN ''Miller'' WHEN 7 THEN ''Davis'' WHEN 8 THEN ''Rodriguez'' WHEN 9 THEN ''Martinez''
+                 END AS ' + QUOTENAME(name)
+
+            /* ---- ADDRESS ---- */
+            WHEN name IN (N'Address 1: Street 1', N'Address1Street1') OR name LIKE N'%Address%1%Street%1%' THEN
+                N'CAST(100 + (ABS(CAST(CHECKSUM(s.Seed + ''_S1N'') AS BIGINT)) % 9000) AS varchar(5))
+                  + '' '' +
+                  CASE ABS(CAST(CHECKSUM(s.Seed + ''_S1NAME'') AS BIGINT)) % 5
+                       WHEN 0 THEN ''Oak St'' WHEN 1 THEN ''Maple Ave'' WHEN 2 THEN ''Pine Dr'' WHEN 3 THEN ''Cedar Ln'' WHEN 4 THEN ''Elm St''
+                  END AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'Address 2: Street 2', N'Address2Street2') OR name LIKE N'%Address%2%Street%2%' THEN
+                N'CASE WHEN ABS(CAST(CHECKSUM(s.Seed + ''_APTFLAG'') AS BIGINT)) % 3 = 0
+                     THEN ''Apt '' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + ''_APT'') AS BIGINT)) % 200) AS varchar(4))
+                     ELSE ''Suite '' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + ''_SUITE'') AS BIGINT)) % 300) AS varchar(4))
+                 END AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'Address 1: City', N'Address1City') OR name LIKE N'%Address%1%City%' THEN
+                N'CASE ABS(CAST(CHECKSUM(s.Seed + ''_CITY'') AS BIGINT)) % 6
+                     WHEN 0 THEN ''Houston'' WHEN 1 THEN ''Dallas'' WHEN 2 THEN ''Austin''
+                     WHEN 3 THEN ''San Antonio'' WHEN 4 THEN ''Fort Worth'' WHEN 5 THEN ''El Paso''
+                 END AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'Address 1: Zip', N'Address1Zip', N'Zip') OR name LIKE N'%Address%1%Zip%' THEN
+                N'RIGHT(''00000'' + CAST(70000 + (ABS(CAST(CHECKSUM(s.Seed + ''_ZIP'') AS BIGINT)) % 999) AS varchar(5)), 5) AS ' + QUOTENAME(name)
+
+            /* ---- PHONES ---- */
+            WHEN name = N'HomePhone' OR (name LIKE N'%Home%Phone%' AND name NOT LIKE N'%relationship%') THEN
+                N'''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_HP'') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS ' + QUOTENAME(name)
+
+            WHEN name = N'WorkPhone' OR name LIKE N'%Work%Phone%' THEN
+                N'''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_WP'') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS ' + QUOTENAME(name)
+
+            WHEN name = N'MobilePhone' OR name LIKE N'%Mobile%Phone%' OR name LIKE N'%Cell%Phone%' THEN
+                N'''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_MP'') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'HomePhone(relationship)', N'RelationshipHomePhone') OR name LIKE N'%Home%Phone%relationship%' THEN
+                N'''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_RHP'') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'MobilePhone(relationship)', N'RelationshipMobilePhone') OR name LIKE N'%Mobile%Phone%relationship%' THEN
+                N'''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_RMP'') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS ' + QUOTENAME(name)
+
+            /* ---- EMAILS ---- */
+            WHEN name IN (N'Primary Email', N'PrimaryEmail') OR name LIKE N'%Primary%Email%' THEN
+                N'''user'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_U'') AS BIGINT))), 12) + ''@example.com'' AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'Secondary Email', N'SecondaryEmail') OR name LIKE N'%Secondary%Email%' THEN
+                N'''alt'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_A'') AS BIGINT))), 12) + ''@example.net'' AS ' + QUOTENAME(name)
+
+            WHEN name IN (N'Email(relationship)', N'RelationshipEmail') OR name LIKE N'%Email%relationship%' THEN
+                N'''contact'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_REM'') AS BIGINT))), 12) + ''@example.org'' AS ' + QUOTENAME(name)
+
+            /* ---- IDENTIFIERS ---- */
+            WHEN name = N'SSN' OR name LIKE N'%SSN%' THEN
+                N'RIGHT(''000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN1'') AS BIGINT)) % 900 + 100 AS varchar(3)), 3)
+                  + ''-'' +
+                  RIGHT(''00'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN2'') AS BIGINT)) % 90 + 10 AS varchar(2)), 2)
+                  + ''-'' +
+                  RIGHT(''0000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN3'') AS BIGINT)) % 9000 + 1000 AS varchar(4)), 4) AS ' + QUOTENAME(name)
+
+            WHEN name = N'MemberNumber' OR name LIKE N'%Member%Number%' THEN
+                N'''MB'' + RIGHT(''00000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_MB'') AS BIGINT)) % 100000000 AS varchar(8)), 8) AS ' + QUOTENAME(name)
+
+            ELSE
+                N'i.' + QUOTENAME(name) + N' AS ' + QUOTENAME(name)
+        END
+        AS nvarchar(max))
+    FROM c
+)
+SELECT
+    @sel = STRING_AGG(CAST(expr AS nvarchar(max)), @sep)
+           WITHIN GROUP (ORDER BY column_id)
+FROM x;
+
+IF NULLIF(@cols, N'') IS NULL OR NULLIF(@sel, N'') IS NULL
 BEGIN
-    SET @set += @comma + QUOTENAME(@cDOB) + N' =
-        DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + ''_DOB'') AS BIGINT)) % 25550, CONVERT(date, ''1940-01-01''))';
-    SET @comma = N', ';
-END
-
-IF @cFN IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cFN) + N' =
-        CASE ABS(CAST(CHECKSUM(s.Seed + ''_FN'') AS BIGINT)) % 10
-            WHEN 0 THEN ''James'' WHEN 1 THEN ''Mary'' WHEN 2 THEN ''John'' WHEN 3 THEN ''Patricia'' WHEN 4 THEN ''Robert''
-            WHEN 5 THEN ''Linda'' WHEN 6 THEN ''Michael'' WHEN 7 THEN ''Barbara'' WHEN 8 THEN ''David'' WHEN 9 THEN ''Elizabeth''
-        END';
-    SET @comma = N', ';
-END
-
-IF @cLN IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cLN) + N' =
-        CASE ABS(CAST(CHECKSUM(s.Seed + ''_LN'') AS BIGINT)) % 10
-            WHEN 0 THEN ''Smith'' WHEN 1 THEN ''Johnson'' WHEN 2 THEN ''Williams'' WHEN 3 THEN ''Brown'' WHEN 4 THEN ''Jones''
-            WHEN 5 THEN ''Garcia'' WHEN 6 THEN ''Miller'' WHEN 7 THEN ''Davis'' WHEN 8 THEN ''Rodriguez'' WHEN 9 THEN ''Martinez''
-        END';
-    SET @comma = N', ';
-END
-
-IF @cS1 IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cS1) + N' =
-        CAST(100 + (ABS(CAST(CHECKSUM(s.Seed + ''_S1N'') AS BIGINT)) % 9000) AS varchar(5))
-        + '' '' +
-        CASE ABS(CAST(CHECKSUM(s.Seed + ''_S1NAME'') AS BIGINT)) % 5
-            WHEN 0 THEN ''Oak St'' WHEN 1 THEN ''Maple Ave'' WHEN 2 THEN ''Pine Dr'' WHEN 3 THEN ''Cedar Ln'' WHEN 4 THEN ''Elm St''
-        END';
-    SET @comma = N', ';
-END
-
-IF @cS2 IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cS2) + N' =
-        CASE WHEN ABS(CAST(CHECKSUM(s.Seed + ''_APTFLAG'') AS BIGINT)) % 3 = 0
-             THEN ''Apt '' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + ''_APT'') AS BIGINT)) % 200) AS varchar(4))
-             ELSE ''Suite '' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + ''_SUITE'') AS BIGINT)) % 300) AS varchar(4))
-        END';
-    SET @comma = N', ';
-END
-
-IF @cCity IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cCity) + N' =
-        CASE ABS(CAST(CHECKSUM(s.Seed + ''_CITY'') AS BIGINT)) % 6
-            WHEN 0 THEN ''Houston'' WHEN 1 THEN ''Dallas'' WHEN 2 THEN ''Austin''
-            WHEN 3 THEN ''San Antonio'' WHEN 4 THEN ''Fort Worth'' WHEN 5 THEN ''El Paso''
-        END';
-    SET @comma = N', ';
-END
-
-IF @cZip IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cZip) + N' =
-        RIGHT(''00000'' + CAST(70000 + (ABS(CAST(CHECKSUM(s.Seed + ''_ZIP'') AS BIGINT)) % 999) AS varchar(5)), 5)';
-    SET @comma = N', ';
-END
-
-IF @cHP IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cHP) + N' =
-        ''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_HP'') AS BIGINT)) % 10000000 AS varchar(7)), 7)';
-    SET @comma = N', ';
-END
-
-IF @cWP IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cWP) + N' =
-        ''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_WP'') AS BIGINT)) % 10000000 AS varchar(7)), 7)';
-    SET @comma = N', ';
-END
-
-IF @cMP IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cMP) + N' =
-        ''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_MP'') AS BIGINT)) % 10000000 AS varchar(7)), 7)';
-    SET @comma = N', ';
-END
-
-IF @cPE IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cPE) + N' =
-        ''user'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_U'') AS BIGINT))), 12) + ''@example.com''';
-    SET @comma = N', ';
-END
-
-IF @cSE IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cSE) + N' =
-        ''alt'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_A'') AS BIGINT))), 12) + ''@example.net''';
-    SET @comma = N', ';
-END
-
-IF @cMB IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cMB) + N' =
-        ''MB'' + RIGHT(''00000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_MB'') AS BIGINT)) % 100000000 AS varchar(8)), 8)';
-    SET @comma = N', ';
-END
-
-IF @cSSN IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cSSN) + N' =
-        RIGHT(''000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN1'') AS BIGINT)) % 900 + 100 AS varchar(3)), 3)
-        + ''-'' +
-        RIGHT(''00'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN2'') AS BIGINT)) % 90 + 10 AS varchar(2)), 2)
-        + ''-'' +
-        RIGHT(''0000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN3'') AS BIGINT)) % 9000 + 1000 AS varchar(4)), 4)';
-    SET @comma = N', ';
-END
-
-IF @cRHP IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cRHP) + N' =
-        ''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_RHP'') AS BIGINT)) % 10000000 AS varchar(7)), 7)';
-    SET @comma = N', ';
-END
-
-IF @cRMP IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cRMP) + N' =
-        ''555'' + RIGHT(''0000000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_RMP'') AS BIGINT)) % 10000000 AS varchar(7)), 7)';
-    SET @comma = N', ';
-END
-
-IF @cREM IS NOT NULL
-BEGIN
-    SET @set += @comma + QUOTENAME(@cREM) + N' =
-        ''contact'' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + ''_REM'') AS BIGINT))), 12) + ''@example.org''';
-    SET @comma = N', ';
-END
-
-IF @set = N''
-BEGIN
-    PRINT 'No matching columns were found to mask. Trigger not created.';
+    RAISERROR('Could not build INSERT/SELECT lists for %s.%s.', 16, 1, @schema, @table);
     RETURN;
 END;
 
 /*=========================================================
-  4) Create/Alter trigger
+  3) Create trigger body
 =========================================================*/
-DECLARE @trg sysname = N'trg_StaticMask_' + @table;
+DECLARE @trgName sysname = N'trg_' + @table + N'_StaticMask_INS';
 
 DECLARE @ddl nvarchar(max) = N'
-CREATE OR ALTER TRIGGER ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trg) + N'
+CREATE TRIGGER ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName) + N'
 ON ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N'
-AFTER INSERT, UPDATE
+INSTEAD OF INSERT
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF TRIGGER_NESTLEVEL() > 1 RETURN;
 
-    UPDATE p
-       SET ' + @set + N'
-    FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' p
-    JOIN inserted i
-      ON ' + @join + N'
-    CROSS APPLY (
-        SELECT Seed = COALESCE(' + @seed + N', CONVERT(varchar(36), NEWID()))
-    ) s;
+    ;WITH src AS (
+        SELECT i.*,
+               Seed =
+                   COALESCE(
+                       NULLIF(LTRIM(RTRIM(
+                           COALESCE(CONVERT(varchar(200), i.[MemberNumber]), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.[SSN]), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.[Primary Email]), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.[PatientFirstName]), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.[PatientLastName]), '''')
+                       )), ''''),
+                       CONVERT(varchar(36), NEWID())
+                   )
+        FROM inserted i
+    )
+    INSERT INTO ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' (' + @cols + N')
+    SELECT ' + @sel + N'
+    FROM src i
+    CROSS APPLY (SELECT Seed = i.Seed) s;
 END;
 ';
+
 EXEC sys.sp_executesql @ddl;
 
-PRINT 'Trigger deployed: ' + QUOTENAME(@schema) + '.' + QUOTENAME(@trg);
-PRINT 'Join condition used
+PRINT ''Created trigger: ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName) + N''';
+GO
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -575,5 +478,19 @@ WHERE i.object_id = OBJECT_ID('S_cdpdynamcs.CDP_DemographicsV7')
   AND i.is_hypothetical=0
   AND ic.is_included_column=0
 ORDER BY i.is_primary_key DESC, i.is_unique DESC, i.name, ic.key_ordinal;
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+SELECT 
+    s.name AS schema_name,
+    t.name AS table_name,
+    OBJECT_ID(QUOTENAME(s.name)+'.'+QUOTENAME(t.name)) AS object_id
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE t.name IN (N'CDP_DemographicsV7', N'CDP_PAT_DEMOGRAPHICS');
+
+
+++++++++++++++++++++++++++++++++++++++++++++
+
 
 
