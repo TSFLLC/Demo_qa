@@ -1,0 +1,489 @@
+1.1) AD group category mapping (using your groups)
+
+USE [TERA];
+GO
+
+IF OBJECT_ID('dbo.Audit_ADGroupCategory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ADGroupCategory
+  (
+    ad_group  SYSNAME NOT NULL PRIMARY KEY,
+    category  VARCHAR(20) NOT NULL CHECK (category IN ('Tech','Business')),
+    note      NVARCHAR(200) NULL
+  );
+END
+GO
+
+MERGE dbo.Audit_ADGroupCategory AS t
+USING (VALUES
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EBI_RO',  'Business', N'RO access'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDP_RO',  'Business', N'RO access'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EAA_RO',  'Business', N'RO access'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-PBI_RO',  'Business', N'RO access'),
+
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_Adm', 'Tech',     N'Admin'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_RW',  'Tech',     N'RW access'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_RO',  'Business', N'RO access'),
+
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_ADM', 'Tech',     N'Admin'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_RW',  'Tech',     N'RW access'),
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_RO',  'Business', N'RO access'),
+
+ (N'ARDENTHEALTH\Sec_SQL_Tera-EA_RW',   'Tech',     N'RW access')
+) AS s(ad_group, category, note)
+ON t.ad_group = s.ad_group
+WHEN MATCHED THEN UPDATE SET category=s.category, note=s.note
+WHEN NOT MATCHED THEN INSERT(ad_group, category, note) VALUES (s.ad_group, s.category, s.note);
+GO
+====================================================================================================
+2.Sensitive keywords list (SSN, DOB, Email, Name, Phone, DEA) 
+
+IF OBJECT_ID('dbo.Audit_SensitiveKeywords','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_SensitiveKeywords
+  (
+    keyword SYSNAME NOT NULL PRIMARY KEY
+  );
+END
+GO
+
+MERGE dbo.Audit_SensitiveKeywords AS t
+USING (VALUES
+ (N'SSN'),
+ (N'DOB'),
+ (N'DateOfBirth'),
+ (N'Email'),
+ (N'EmailAddress'),
+ (N'Phone'),
+ (N'PhoneNumber'),
+ (N'Mobile'),
+ (N'Cell'),
+ (N'DEA'),
+ (N'DEANumber'),
+ -- safer “Name” coverage (avoids noise from object_name/schema_name/username)
+ (N'FirstName'),
+ (N'LastName'),
+ (N'FullName'),
+ (N'PatientName'),
+ (N'Patient_First_Name'),
+ (N'Patient_Last_Name')
+) AS s(keyword)
+ON t.keyword = s.keyword
+WHEN NOT MATCHED THEN INSERT(keyword) VALUES (s.keyword);
+GO
+=============================================================================================================
+3) Cache table (login → Tech/Business/Unknown)
+IF OBJECT_ID('dbo.Audit_UserCategoryCache','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_UserCategoryCache
+  (
+    login_name SYSNAME NOT NULL PRIMARY KEY,
+    category   VARCHAR(20) NOT NULL CHECK (category IN ('Tech','Business','Unknown')),
+    matched_group SYSNAME NULL,
+    refreshed_at DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+==============================================================================================================
+4) Refresh cache using AD membership (xp_logininfo)
+
+CREATE OR ALTER PROCEDURE dbo.usp_Refresh_AuditUserCategoryCache
+    @LookbackHours INT = 72
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @Since DATETIME2(7) = DATEADD(HOUR, -@LookbackHours, SYSUTCDATETIME());
+
+  IF OBJECT_ID('tempdb..#Users') IS NOT NULL DROP TABLE #Users;
+  CREATE TABLE #Users(login_name SYSNAME PRIMARY KEY);
+
+  INSERT INTO #Users(login_name)
+  SELECT DISTINCT a.server_principal_name
+  FROM dbo.v_Audit_All a
+  WHERE a.event_time >= @Since
+    AND NULLIF(LTRIM(RTRIM(a.server_principal_name)), '') IS NOT NULL
+    AND a.server_principal_name NOT LIKE 'svc%'
+    AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+    AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins);
+
+  DECLARE @login SYSNAME;
+
+  DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT login_name FROM #Users;
+
+  OPEN cur;
+  FETCH NEXT FROM cur INTO @login;
+
+  WHILE @@FETCH_STATUS = 0
+  BEGIN
+    BEGIN TRY
+      IF OBJECT_ID('tempdb..#Groups') IS NOT NULL DROP TABLE #Groups;
+      CREATE TABLE #Groups
+      (
+        accountname SYSNAME NULL,
+        type        SYSNAME NULL,
+        privilege   SYSNAME NULL,
+        mappedlogin SYSNAME NULL,
+        permissionpath SYSNAME NULL
+      );
+
+      INSERT INTO #Groups
+      EXEC master..xp_logininfo @acctname = @login, @option = 'all';
+
+      DECLARE @matched_group SYSNAME = NULL;
+      DECLARE @category VARCHAR(20) = 'Unknown';
+
+      -- Pick the first matching group (prefers Tech if both)
+      SELECT TOP (1)
+          @matched_group = g.accountname,
+          @category = m.category
+      FROM #Groups g
+      JOIN dbo.Audit_ADGroupCategory m
+        ON g.accountname = m.ad_group
+      ORDER BY CASE m.category WHEN 'Tech' THEN 1 WHEN 'Business' THEN 2 ELSE 9 END;
+
+      MERGE dbo.Audit_UserCategoryCache AS t
+      USING (SELECT @login AS login_name) AS s
+      ON t.login_name = s.login_name
+      WHEN MATCHED THEN
+        UPDATE SET category = @category,
+                   matched_group = @matched_group,
+                   refreshed_at = SYSUTCDATETIME()
+      WHEN NOT MATCHED THEN
+        INSERT(login_name, category, matched_group, refreshed_at)
+        VALUES(@login, @category, @matched_group, SYSUTCDATETIME());
+
+    END TRY
+    BEGIN CATCH
+      MERGE dbo.Audit_UserCategoryCache AS t
+      USING (SELECT @login AS login_name) AS s
+      ON t.login_name = s.login_name
+      WHEN MATCHED THEN
+        UPDATE SET category = 'Unknown',
+                   matched_group = NULL,
+                   refreshed_at = SYSUTCDATETIME()
+      WHEN NOT MATCHED THEN
+        INSERT(login_name, category, matched_group, refreshed_at)
+        VALUES(@login, 'Unknown', NULL, SYSUTCDATETIME());
+    END CATCH
+
+    FETCH NEXT FROM cur INTO @login;
+  END
+
+  CLOSE cur;
+  DEALLOCATE cur;
+END
+GO
+========================================================================
+
+5) Email procedure: “Tech vs Business + WHERE sensitive hits” (two tables)
+CREATE OR ALTER PROCEDURE dbo.usp_Email_AuditReport_PHI_WhereSensitive_TechVsBusiness
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @HoursBack   INT = 24,
+    @RefreshCacheLookbackHours INT = 72
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Refresh category cache first
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache @LookbackHours = @RefreshCacheLookbackHours;
+
+    DECLARE @StartTime DATETIME2(7) = DATEADD(HOUR, -@HoursBack, SYSUTCDATETIME());
+    DECLARE @EndTime   DATETIME2(7) = SYSUTCDATETIME();
+
+    DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%; table-layout:fixed;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word; white-space:normal;}
+  th{background:#f3f3f3;}
+  .col-time{width:150px;}
+  .col-cat{width:90px;}
+  .col-login{width:190px;}
+  .col-group{width:220px;}
+  .col-obj{width:220px;}
+  .col-ip{width:120px;}
+  .col-app{width:220px;}
+  .col-key{width:120px;}
+  .col-where{width:auto;}
+</style>';
+
+    DECLARE @html NVARCHAR(MAX) =
+        @style
+      + N'<h2>PHI Audit Report - Tech vs Business (WHERE on Sensitive Fields)</h2>'
+      + N'<p>Window (UTC): ' + CONVERT(NVARCHAR(30), @StartTime, 126)
+      + N' to ' + CONVERT(NVARCHAR(30), @EndTime, 126) + N'</p>';
+
+    ;WITH base AS
+    (
+      SELECT
+          a.event_time,
+          a.server_principal_name AS login_name,
+          COALESCE(c.category,'Unknown') AS user_category,
+          c.matched_group,
+          a.schema_name,
+          a.object_name,
+          a.client_ip,
+          a.application_name,
+          a.statement,
+          LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c
+        ON c.login_name = a.server_principal_name
+      WHERE a.event_time >= @StartTime AND a.event_time < @EndTime
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+    ),
+    where_part AS
+    (
+      SELECT *,
+             CASE WHEN stmt_l LIKE '% where %' THEN 1 ELSE 0 END AS has_where,
+             CASE WHEN stmt_l LIKE '% where %'
+                  THEN SUBSTRING(stmt_l, CHARINDEX(' where ', stmt_l), 4000)
+                  ELSE NULL END AS where_text
+      FROM base
+    ),
+    hits AS
+    (
+      SELECT
+          w.*,
+          sk.keyword AS matched_keyword
+      FROM where_part w
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE w.has_where = 1
+          AND w.where_text LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE w.has_where = 1
+        AND sk.keyword IS NOT NULL
+    )
+    SELECT 1; -- (anchor)
+
+    DECLARE @BusinessRows NVARCHAR(MAX) = N'';
+    DECLARE @TechRows     NVARCHAR(MAX) = N'';
+    DECLARE @UnknownRows  NVARCHAR(MAX) = N'';
+
+    -- Build Business rows
+    SELECT @BusinessRows =
+    (
+      SELECT
+        N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+        + N'</tr>'
+      FROM
+      (
+        SELECT
+          event_time, user_category, login_name, matched_group,
+          schema_name, object_name, client_ip, application_name,
+          matched_keyword, where_text
+        FROM
+        (
+          SELECT
+            event_time, user_category, login_name, matched_group,
+            schema_name, object_name, client_ip, application_name,
+            matched_keyword,
+            SUBSTRING(LOWER(statement), CHARINDEX(' where ', LOWER(statement)), 4000) AS where_text
+          FROM dbo.v_Audit_PHI_Selects a
+          LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+          OUTER APPLY (
+            SELECT TOP (1) keyword
+            FROM dbo.Audit_SensitiveKeywords
+            WHERE LOWER(a.statement) LIKE '% where %'
+              AND LOWER(a.statement) LIKE '%' + LOWER(keyword) + '%'
+            ORDER BY keyword
+          ) sk
+          WHERE a.event_time >= @StartTime AND a.event_time < @EndTime
+            AND a.server_principal_name NOT LIKE 'svc%'
+            AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+            AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+            AND LOWER(a.statement) LIKE '% where %'
+            AND sk.keyword IS NOT NULL
+            AND COALESCE(c.category,'Unknown') = 'Business'
+        ) x
+      ) y
+      ORDER BY event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    -- Build Tech rows
+    SELECT @TechRows =
+    (
+      SELECT
+        N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+        + N'</tr>'
+      FROM
+      (
+        SELECT
+          event_time, user_category, login_name, matched_group,
+          schema_name, object_name, client_ip, application_name,
+          matched_keyword, where_text
+        FROM
+        (
+          SELECT
+            event_time, COALESCE(c.category,'Unknown') AS user_category,
+            a.server_principal_name AS login_name,
+            c.matched_group,
+            a.schema_name, a.object_name, a.client_ip, a.application_name,
+            sk.keyword AS matched_keyword,
+            SUBSTRING(LOWER(a.statement), CHARINDEX(' where ', LOWER(a.statement)), 4000) AS where_text
+          FROM dbo.v_Audit_PHI_Selects a
+          LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+          OUTER APPLY (
+            SELECT TOP (1) keyword
+            FROM dbo.Audit_SensitiveKeywords
+            WHERE LOWER(a.statement) LIKE '% where %'
+              AND LOWER(a.statement) LIKE '%' + LOWER(keyword) + '%'
+            ORDER BY keyword
+          ) sk
+          WHERE a.event_time >= @StartTime AND a.event_time < @EndTime
+            AND a.server_principal_name NOT LIKE 'svc%'
+            AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+            AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+            AND LOWER(a.statement) LIKE '% where %'
+            AND sk.keyword IS NOT NULL
+            AND COALESCE(c.category,'Unknown') = 'Tech'
+        ) x
+      ) y
+      ORDER BY event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    -- Unknown rows (optional, but helpful)
+    SELECT @UnknownRows =
+    (
+      SELECT
+        N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+        + N'</tr>'
+      FROM
+      (
+        SELECT
+          a.event_time,
+          COALESCE(c.category,'Unknown') AS user_category,
+          a.server_principal_name AS login_name,
+          c.matched_group,
+          a.schema_name, a.object_name, a.client_ip, a.application_name,
+          sk.keyword AS matched_keyword,
+          SUBSTRING(LOWER(a.statement), CHARINDEX(' where ', LOWER(a.statement)), 4000) AS where_text
+        FROM dbo.v_Audit_PHI_Selects a
+        LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+        OUTER APPLY (
+          SELECT TOP (1) keyword
+          FROM dbo.Audit_SensitiveKeywords
+          WHERE LOWER(a.statement) LIKE '% where %'
+            AND LOWER(a.statement) LIKE '%' + LOWER(keyword) + '%'
+          ORDER BY keyword
+        ) sk
+        WHERE a.event_time >= @StartTime AND a.event_time < @EndTime
+          AND a.server_principal_name NOT LIKE 'svc%'
+          AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+          AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+          AND LOWER(a.statement) LIKE '% where %'
+          AND sk.keyword IS NOT NULL
+          AND COALESCE(c.category,'Unknown') = 'Unknown'
+      ) u
+      ORDER BY event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    DECLARE @header NVARCHAR(MAX) =
+        N'<table>'
+      + N'<tr>'
+      + N'<th class="col-time">event_time</th>'
+      + N'<th class="col-cat">category</th>'
+      + N'<th class="col-login">login</th>'
+      + N'<th class="col-group">matched AD group</th>'
+      + N'<th class="col-obj">object</th>'
+      + N'<th class="col-ip">client_ip</th>'
+      + N'<th class="col-app">application</th>'
+      + N'<th class="col-key">keyword</th>'
+      + N'<th class="col-where">WHERE snippet</th>'
+      + N'</tr>';
+
+    SET @html += N'<h3>Business (WHERE on Sensitive Fields)</h3>'
+      + CASE WHEN @BusinessRows IS NULL OR LEN(@BusinessRows)=0
+             THEN N'<p><b>No Business WHERE-sensitive hits.</b></p>'
+             ELSE @header + @BusinessRows + N'</table>' END;
+
+    SET @html += N'<h3>Tech (WHERE on Sensitive Fields)</h3>'
+      + CASE WHEN @TechRows IS NULL OR LEN(@TechRows)=0
+             THEN N'<p><b>No Tech WHERE-sensitive hits.</b></p>'
+             ELSE @header + @TechRows + N'</table>' END;
+
+    SET @html += N'<h3>Unknown (Not in mapped AD groups)</h3>'
+      + CASE WHEN @UnknownRows IS NULL OR LEN(@UnknownRows)=0
+             THEN N'<p><b>No Unknown WHERE-sensitive hits.</b></p>'
+             ELSE @header + @UnknownRows + N'</table>' END;
+
+    EXEC msdb.dbo.sp_send_dbmail
+      @profile_name = @ProfileName,
+      @recipients   = @Recipients,
+      @subject      = 'Daily PHI Audit - Tech vs Business (WHERE Sensitive Fields)',
+      @body         = @html,
+      @body_format  = 'HTML';
+END
+GO
+
+
+==========================================================
+How to test it right now
+
+EXEC dbo.usp_Email_AuditReport_PHI_WhereSensitive_TechVsBusiness
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'security@company.com;dba@company.com',
+  @HoursBack   = 24,
+  @RefreshCacheLookbackHours = 168; -- first run: last 7 days
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+✅ Add it to your daily SQL Agent Job (new step)
+USE msdb;
+GO
+
+EXEC dbo.sp_add_jobstep
+  @job_name = N'Daily_TERA_Audit_Reports',
+  @step_name = N'Email PHI WHERE-Sensitive (Tech vs Business)',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'EXEC dbo.usp_Email_AuditReport_PHI_WhereSensitive_TechVsBusiness
+                @ProfileName = N''DBA-Mail'',
+                @Recipients  = N''security@company.com;dba@company.com'',
+                @HoursBack   = 24,
+                @RefreshCacheLookbackHours = 72;';
+GO
+
+
+
