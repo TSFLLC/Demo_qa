@@ -1,0 +1,296 @@
+1) Watermark + cooldown table
+USE [TERA];
+GO
+
+IF OBJECT_ID('dbo.Audit_AlertWatermark','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_AlertWatermark
+  (
+    alert_name SYSNAME NOT NULL PRIMARY KEY,
+    last_event_time DATETIME2(7) NOT NULL,
+    last_email_time DATETIME2(7) NULL
+  );
+
+  INSERT INTO dbo.Audit_AlertWatermark(alert_name, last_event_time, last_email_time)
+  VALUES (N'PHI_WhereSensitive', '1900-01-01T00:00:00', NULL);
+END
+GO
+
+
+++++++++++++2) Alert procedure (new hits only + Tech/Business + optional cooldown)++++++++++++++++
+
+
+
+CREATE OR ALTER PROCEDURE dbo.usp_Alert_PHI_WhereSensitive_NewOnly
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @SafetyOverlapSeconds INT = 30,     -- overlap to avoid missing events
+    @MaxRowsPerEmail INT = 200,         -- prevent huge emails
+    @CooldownSeconds INT = 0            -- set to e.g. 120 to avoid spam
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @last DATETIME2(7), @lastEmail DATETIME2(7);
+
+    SELECT
+      @last = last_event_time,
+      @lastEmail = last_email_time
+    FROM dbo.Audit_AlertWatermark
+    WHERE alert_name = N'PHI_WhereSensitive';
+
+    IF @last IS NULL SET @last = '1900-01-01T00:00:00';
+
+    DECLARE @now DATETIME2(7) = SYSUTCDATETIME();
+
+    -- Optional cooldown to reduce email storms
+    IF @CooldownSeconds > 0 AND @lastEmail IS NOT NULL
+    BEGIN
+      IF DATEDIFF(SECOND, @lastEmail, @now) < @CooldownSeconds
+      BEGIN
+        UPDATE dbo.Audit_AlertWatermark
+          SET last_event_time = @now
+        WHERE alert_name = N'PHI_WhereSensitive';
+        RETURN;
+      END
+    END
+
+    DECLARE @since DATETIME2(7) = DATEADD(SECOND, -@SafetyOverlapSeconds, @last);
+
+    -- Refresh AD cache so Tech/Business stays current
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache @LookbackHours = 72;
+
+    ;WITH base AS
+    (
+      SELECT TOP (@MaxRowsPerEmail)
+          a.event_time,
+          a.server_principal_name AS login_name,
+          COALESCE(c.category,'Unknown') AS user_category,
+          c.matched_group,
+          a.schema_name,
+          a.object_name,
+          a.client_ip,
+          a.application_name,
+          a.statement,
+          LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c
+        ON c.login_name = a.server_principal_name
+      WHERE a.event_time > @since
+        AND a.event_time <= @now
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+        AND LOWER(a.statement) LIKE '% where %'
+      ORDER BY a.event_time DESC
+    ),
+    hits AS
+    (
+      SELECT
+        b.*,
+        sk.keyword AS matched_keyword,
+        SUBSTRING(b.stmt_l, CHARINDEX(' where ', b.stmt_l), 4000) AS where_text
+      FROM base b
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE b.stmt_l LIKE '% where %'
+          AND b.stmt_l LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE sk.keyword IS NOT NULL
+    )
+    SELECT *
+    INTO #NewHits
+    FROM hits;
+
+    IF EXISTS (SELECT 1 FROM #NewHits)
+    BEGIN
+      DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%; table-layout:fixed;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word; white-space:normal;}
+  th{background:#f3f3f3;}
+  .col-time{width:150px;}
+  .col-cat{width:90px;}
+  .col-login{width:190px;}
+  .col-group{width:220px;}
+  .col-obj{width:220px;}
+  .col-ip{width:120px;}
+  .col-app{width:220px;}
+  .col-key{width:120px;}
+  .col-where{width:auto;}
+</style>';
+
+      DECLARE @html NVARCHAR(MAX) =
+          @style
+        + N'<h2>ALERT: PHI WHERE-Sensitive Access (New Events)</h2>'
+        + N'<p>Generated (UTC): ' + CONVERT(NVARCHAR(30), @now, 126) + N'</p>'
+        + N'<p>Scan window (UTC): ' + CONVERT(NVARCHAR(30), @since, 126)
+        + N' to ' + CONVERT(NVARCHAR(30), @now, 126) + N'</p>';
+
+      DECLARE @header NVARCHAR(MAX) =
+        N'<table><tr>'
+        + N'<th class="col-time">event_time</th>'
+        + N'<th class="col-cat">category</th>'
+        + N'<th class="col-login">login</th>'
+        + N'<th class="col-group">matched AD group</th>'
+        + N'<th class="col-obj">object</th>'
+        + N'<th class="col-ip">client_ip</th>'
+        + N'<th class="col-app">application</th>'
+        + N'<th class="col-key">keyword</th>'
+        + N'<th class="col-where">WHERE snippet</th>'
+        + N'</tr>';
+
+      DECLARE @BusinessRows NVARCHAR(MAX) = N'';
+      DECLARE @TechRows NVARCHAR(MAX) = N'';
+      DECLARE @UnknownRows NVARCHAR(MAX) = N'';
+
+      SELECT @BusinessRows =
+      (
+        SELECT N'<tr>'
+          + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td class="col-cat">' + user_category + N'</td>'
+          + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+          + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+          + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+          + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+          + N'</tr>'
+        FROM #NewHits
+        WHERE user_category = 'Business'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+      ).value('.','nvarchar(max)');
+
+      SELECT @TechRows =
+      (
+        SELECT N'<tr>'
+          + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td class="col-cat">' + user_category + N'</td>'
+          + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+          + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+          + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+          + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+          + N'</tr>'
+        FROM #NewHits
+        WHERE user_category = 'Tech'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+      ).value('.','nvarchar(max)');
+
+      SELECT @UnknownRows =
+      (
+        SELECT N'<tr>'
+          + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td class="col-cat">' + user_category + N'</td>'
+          + N'<td class="col-login">' + ISNULL(login_name,N'') + N'</td>'
+          + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+          + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+          + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 600) + N'</td>'
+          + N'</tr>'
+        FROM #NewHits
+        WHERE user_category = 'Unknown'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+      ).value('.','nvarchar(max)');
+
+      SET @html += N'<h3>Business</h3>'
+        + CASE WHEN @BusinessRows IS NULL OR LEN(@BusinessRows)=0
+               THEN N'<p><b>No new Business hits.</b></p>'
+               ELSE @header + @BusinessRows + N'</table>' END;
+
+      SET @html += N'<h3>Tech</h3>'
+        + CASE WHEN @TechRows IS NULL OR LEN(@TechRows)=0
+               THEN N'<p><b>No new Tech hits.</b></p>'
+               ELSE @header + @TechRows + N'</table>' END;
+
+      SET @html += N'<h3>Unknown</h3>'
+        + CASE WHEN @UnknownRows IS NULL OR LEN(@UnknownRows)=0
+               THEN N'<p><b>No new Unknown hits.</b></p>'
+               ELSE @header + @UnknownRows + N'</table>' END;
+
+      EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = @ProfileName,
+        @recipients   = @Recipients,
+        @subject      = 'ALERT: PHI WHERE-Sensitive Access (Near Real-Time)',
+        @body         = @html,
+        @body_format  = 'HTML';
+
+      UPDATE dbo.Audit_AlertWatermark
+        SET last_email_time = @now
+      WHERE alert_name = N'PHI_WhereSensitive';
+    END
+
+    UPDATE dbo.Audit_AlertWatermark
+      SET last_event_time = @now
+    WHERE alert_name = N'PHI_WhereSensitive';
+END
+GO
++++++++++++++++3. SQL Agent job: run every 10 seconds+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+USE msdb;
+GO
+
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'ALERT_TERA_PHI_WhereSensitive_10sec')
+  EXEC msdb.dbo.sp_delete_job @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec';
+GO
+
+EXEC msdb.dbo.sp_add_job
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @enabled = 1,
+  @description = N'Near-real-time alert: PHI SELECT with WHERE on sensitive fields (every 10 seconds).';
+GO
+
+EXEC msdb.dbo.sp_add_jobstep
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @step_name = N'Send New Alerts',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'
+EXEC dbo.usp_Alert_PHI_WhereSensitive_NewOnly
+  @ProfileName = N''DBA-Mail'',
+  @Recipients  = N''security@company.com;dba@company.com'',
+  @SafetyOverlapSeconds = 30,
+  @MaxRowsPerEmail = 200,
+  @CooldownSeconds = 0;
+';
+GO
+
+-- Schedule every 10 seconds
+EXEC msdb.dbo.sp_add_schedule
+  @schedule_name = N'Every_10_Seconds',
+  @freq_type = 4,               -- daily
+  @freq_interval = 1,
+  @freq_subday_type = 2,        -- seconds
+  @freq_subday_interval = 10,   -- every 10 seconds
+  @active_start_time = 000000;
+GO
+
+EXEC msdb.dbo.sp_attach_schedule
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @schedule_name = N'Every_10_Seconds';
+GO
+
+EXEC msdb.dbo.sp_add_jobserver
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec';
+GO
+
++++++++++++++++++++++start jobs now+++++++++++++++++++++++++++++++++++++++++
+EXEC msdb.dbo.sp_start_job N'ALERT_TERA_PHI_WhereSensitive_10sec';
+
+
+
+
+
