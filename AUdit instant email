@@ -389,3 +389,21 @@ EXEC msdb.dbo.sp_start_job N'ALERT_TERA_PHI_WhereSensitive_10sec';
 
 
 
++++++++++++++++++++Quick test (manual run)+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+EXEC dbo.usp_Alert_PHI_WhereSensitive_NewOnly
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'your.manager@company.com',
+  @SafetyOverlapSeconds = 30,
+  @MaxRowsPerEmail = 200,
+  @CooldownSeconds = 0;
+
+
++++++++++++++Confirm the job exists+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+SELECT name, enabled
+FROM msdb.dbo.sysjobs
+WHERE name = N'ALERT_TERA_PHI_WhereSensitive_10sec';
+
+
+
+
