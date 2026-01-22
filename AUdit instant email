@@ -1,6 +1,30 @@
 USE [TERA];
 GO
 
+IF OBJECT_ID('dbo.Audit_AlertWatermark','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_AlertWatermark
+  (
+    alert_name SYSNAME NOT NULL PRIMARY KEY,
+    last_event_time DATETIME2(7) NOT NULL,
+    last_email_time DATETIME2(7) NULL
+  );
+
+  INSERT INTO dbo.Audit_AlertWatermark(alert_name, last_event_time, last_email_time)
+  VALUES (N'PHI_WhereSensitive', '1900-01-01T00:00:00', NULL);
+END
+GO
+
+------------------------------------------------------------------------------------------------
+SELECT *
+FROM dbo.Audit_AlertWatermark;
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+USE [TERA];
+GO
+
 CREATE OR ALTER PROCEDURE dbo.usp_Alert_PHI_WhereSensitive_NewOnly
     @ProfileName SYSNAME,
     @Recipients  NVARCHAR(MAX),
