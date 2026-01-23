@@ -1,0 +1,258 @@
+/*=========================================================
+  STATIC MASKING (existing rows) — ONLY SSN + NAME + DOB
+  Table: S_cdpdynamcs.CDP_DemographicsV7
+=========================================================*/
+
+DECLARE @schema sysname = N'S_cdpdynamcs';
+DECLARE @table  sysname = N'CDP_DemographicsV7';
+DECLARE @objId  int = OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@table));
+
+IF @objId IS NULL
+BEGIN
+    RAISERROR('Table %s.%s not found.', 16, 1, @schema, @table);
+    RETURN;
+END;
+
+DECLARE
+    @cDOB sysname,
+    @cFN  sysname,
+    @cLN  sysname,
+    @cSSN sysname;
+
+;WITH c AS (
+    SELECT name FROM sys.columns WHERE object_id = @objId
+)
+SELECT
+    @cDOB = (SELECT TOP 1 name FROM c WHERE name IN (N'DateofBirth', N'DateOfBirth', N'DOB') OR name LIKE N'%Birth%'),
+    @cFN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientFirstName', N'FirstName') OR name LIKE N'%First%Name%'),
+    @cLN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientLastName',  N'LastName')  OR name LIKE N'%Last%Name%'),
+    @cSSN = (SELECT TOP 1 name FROM c WHERE name IN (N'SSN', N'PatientSSN') OR name LIKE N'%SSN%');
+
+IF @cDOB IS NULL AND @cFN IS NULL AND @cLN IS NULL AND @cSSN IS NULL
+BEGIN
+    PRINT 'No DOB / FirstName / LastName / SSN-like columns found. Nothing to mask.';
+    RETURN;
+END;
+
+DECLARE @set nvarchar(max) = N'';
+DECLARE @comma nvarchar(2) = N'';
+
+-- Seed uses the fields we are masking (when they exist); otherwise a NEWID per row
+DECLARE @seedExpr nvarchar(max) =
+N'COALESCE(
+      NULLIF(LTRIM(RTRIM(
+          COALESCE(CONVERT(varchar(200), p.' + COALESCE(QUOTENAME(@cSSN), N'NULL') + N'), '''') + ''|'' +
+          COALESCE(CONVERT(varchar(200), p.' + COALESCE(QUOTENAME(@cFN ), N'NULL') + N'), '''') + ''|'' +
+          COALESCE(CONVERT(varchar(200), p.' + COALESCE(QUOTENAME(@cLN ), N'NULL') + N'), '''') + ''|'' +
+          COALESCE(CONVERT(varchar(30),  p.' + COALESCE(QUOTENAME(@cDOB), N'NULL') + N', 120), '''')
+      )), ''''),
+      CONVERT(varchar(36), NEWID())
+ )';
+
+IF @cDOB IS NOT NULL
+BEGIN
+    SET @set += @comma + QUOTENAME(@cDOB) + N' =
+        DATEADD(DAY,
+            ABS(CAST(CHECKSUM(s.Seed + ''_DOB'') AS BIGINT)) % 25550,
+            CONVERT(date, ''1940-01-01'')
+        )';
+    SET @comma = N', ';
+END
+
+IF @cFN IS NOT NULL
+BEGIN
+    SET @set += @comma + QUOTENAME(@cFN) + N' =
+        CASE ABS(CAST(CHECKSUM(s.Seed + ''_FN'') AS BIGINT)) % 10
+            WHEN 0 THEN ''James'' WHEN 1 THEN ''Mary'' WHEN 2 THEN ''John'' WHEN 3 THEN ''Patricia'' WHEN 4 THEN ''Robert''
+            WHEN 5 THEN ''Linda'' WHEN 6 THEN ''Michael'' WHEN 7 THEN ''Barbara'' WHEN 8 THEN ''David'' WHEN 9 THEN ''Elizabeth''
+        END';
+    SET @comma = N', ';
+END
+
+IF @cLN IS NOT NULL
+BEGIN
+    SET @set += @comma + QUOTENAME(@cLN) + N' =
+        CASE ABS(CAST(CHECKSUM(s.Seed + ''_LN'') AS BIGINT)) % 10
+            WHEN 0 THEN ''Smith'' WHEN 1 THEN ''Johnson'' WHEN 2 THEN ''Williams'' WHEN 3 THEN ''Brown'' WHEN 4 THEN ''Jones''
+            WHEN 5 THEN ''Garcia'' WHEN 6 THEN ''Miller'' WHEN 7 THEN ''Davis'' WHEN 8 THEN ''Rodriguez'' WHEN 9 THEN ''Martinez''
+        END';
+    SET @comma = N', ';
+END
+
+IF @cSSN IS NOT NULL
+BEGIN
+    SET @set += @comma + QUOTENAME(@cSSN) + N' =
+        RIGHT(''000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN1'') AS BIGINT)) % 900 + 100 AS varchar(3)), 3)
+        + ''-'' +
+        RIGHT(''00'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN2'') AS BIGINT)) % 90 + 10 AS varchar(2)), 2)
+        + ''-'' +
+        RIGHT(''0000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN3'') AS BIGINT)) % 9000 + 1000 AS varchar(4)), 4)';
+END
+
+DECLARE @sql nvarchar(max) = N'
+UPDATE p
+SET ' + @set + N'
+FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' AS p
+CROSS APPLY (SELECT Seed = ' + @seedExpr + N') AS s;
+';
+
+EXEC sys.sp_executesql @sql;
+GO
+
+
++++++++++++++++++++++++++trigger++++++++++++++++++++++++++++++++++++++
+
+/*=========================================================
+  INSTEAD OF INSERT Trigger — ONLY SSN + NAME + DOB masked
+=========================================================*/
+
+DECLARE @schema sysname = N'S_cdpdynamcs';
+DECLARE @table  sysname = N'CDP_DemographicsV7';
+DECLARE @objId  int = OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@table));
+
+IF @objId IS NULL
+BEGIN
+    RAISERROR('Table %s.%s not found.', 16, 1, @schema, @table);
+    RETURN;
+END;
+
+DECLARE @trgName sysname = N'trg_' + @table + N'_StaticMask_INS';
+
+-- Drop old trigger if exists
+IF OBJECT_ID(QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName), 'TR') IS NOT NULL
+BEGIN
+    EXEC sys.sp_executesql N'DROP TRIGGER ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName) + N';';
+END;
+
+DECLARE
+    @cDOB sysname,
+    @cFN  sysname,
+    @cLN  sysname,
+    @cSSN sysname;
+
+;WITH c AS (
+    SELECT name FROM sys.columns WHERE object_id = @objId
+)
+SELECT
+    @cDOB = (SELECT TOP 1 name FROM c WHERE name IN (N'DateofBirth', N'DateOfBirth', N'DOB') OR name LIKE N'%Birth%'),
+    @cFN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientFirstName', N'FirstName') OR name LIKE N'%First%Name%'),
+    @cLN  = (SELECT TOP 1 name FROM c WHERE name IN (N'PatientLastName',  N'LastName')  OR name LIKE N'%Last%Name%'),
+    @cSSN = (SELECT TOP 1 name FROM c WHERE name IN (N'SSN', N'PatientSSN') OR name LIKE N'%SSN%');
+
+DECLARE @cols nvarchar(max);
+DECLARE @sel  nvarchar(max);
+DECLARE @sep  nvarchar(10) = N', ' + NCHAR(13) + NCHAR(10);
+
+;WITH c AS (
+    SELECT
+        col.name,
+        col.column_id,
+        col.is_identity,
+        col.is_computed,
+        typ.name AS type_name
+    FROM sys.columns col
+    JOIN sys.types typ
+      ON col.user_type_id = typ.user_type_id
+    WHERE col.object_id = @objId
+      AND col.is_identity = 0
+      AND col.is_computed = 0
+      AND typ.name NOT IN (N'timestamp', N'rowversion')
+)
+SELECT
+    @cols = STRING_AGG(CAST(QUOTENAME(name) AS nvarchar(max)), N', ')
+            WITHIN GROUP (ORDER BY column_id)
+FROM c;
+
+;WITH c AS (
+    SELECT
+        col.name,
+        col.column_id,
+        typ.name AS type_name
+    FROM sys.columns col
+    JOIN sys.types typ
+      ON col.user_type_id = typ.user_type_id
+    WHERE col.object_id = @objId
+      AND col.is_identity = 0
+      AND col.is_computed = 0
+      AND typ.name NOT IN (N'timestamp', N'rowversion')
+),
+x AS (
+    SELECT
+        name,
+        column_id,
+        expr = CAST(
+            CASE
+                WHEN @cDOB IS NOT NULL AND name = @cDOB THEN
+                    N'DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + ''_DOB'') AS BIGINT)) % 25550, CONVERT(date,''1940-01-01'')) AS ' + QUOTENAME(name)
+
+                WHEN @cFN IS NOT NULL AND name = @cFN THEN
+                    N'CASE ABS(CAST(CHECKSUM(s.Seed + ''_FN'') AS BIGINT)) % 10
+                         WHEN 0 THEN ''James'' WHEN 1 THEN ''Mary'' WHEN 2 THEN ''John'' WHEN 3 THEN ''Patricia'' WHEN 4 THEN ''Robert''
+                         WHEN 5 THEN ''Linda'' WHEN 6 THEN ''Michael'' WHEN 7 THEN ''Barbara'' WHEN 8 THEN ''David'' WHEN 9 THEN ''Elizabeth''
+                     END AS ' + QUOTENAME(name)
+
+                WHEN @cLN IS NOT NULL AND name = @cLN THEN
+                    N'CASE ABS(CAST(CHECKSUM(s.Seed + ''_LN'') AS BIGINT)) % 10
+                         WHEN 0 THEN ''Smith'' WHEN 1 THEN ''Johnson'' WHEN 2 THEN ''Williams'' WHEN 3 THEN ''Brown'' WHEN 4 THEN ''Jones''
+                         WHEN 5 THEN ''Garcia'' WHEN 6 THEN ''Miller'' WHEN 7 THEN ''Davis'' WHEN 8 THEN ''Rodriguez'' WHEN 9 THEN ''Martinez''
+                     END AS ' + QUOTENAME(name)
+
+                WHEN @cSSN IS NOT NULL AND name = @cSSN THEN
+                    N'RIGHT(''000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN1'') AS BIGINT)) % 900 + 100 AS varchar(3)), 3)
+                      + ''-'' +
+                      RIGHT(''00'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN2'') AS BIGINT)) % 90 + 10 AS varchar(2)), 2)
+                      + ''-'' +
+                      RIGHT(''0000'' + CAST(ABS(CAST(CHECKSUM(s.Seed + ''_SSN3'') AS BIGINT)) % 9000 + 1000 AS varchar(4)), 4) AS ' + QUOTENAME(name)
+
+                ELSE
+                    N'i.' + QUOTENAME(name) + N' AS ' + QUOTENAME(name)
+            END
+        AS nvarchar(max))
+    FROM c
+)
+SELECT
+    @sel = STRING_AGG(CAST(expr AS nvarchar(max)), @sep)
+           WITHIN GROUP (ORDER BY column_id)
+FROM x;
+
+IF NULLIF(@cols, N'') IS NULL OR NULLIF(@sel, N'') IS NULL
+BEGIN
+    RAISERROR('Could not build INSERT/SELECT lists for %s.%s.', 16, 1, @schema, @table);
+    RETURN;
+END;
+
+DECLARE @ddl nvarchar(max) = N'
+CREATE TRIGGER ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName) + N'
+ON ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N'
+INSTEAD OF INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ;WITH src AS (
+        SELECT i.*,
+               Seed =
+                   COALESCE(
+                       NULLIF(LTRIM(RTRIM(
+                           COALESCE(CONVERT(varchar(200), i.' + COALESCE(QUOTENAME(@cSSN), N'NULL') + N'), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.' + COALESCE(QUOTENAME(@cFN ), N'NULL') + N'), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(200), i.' + COALESCE(QUOTENAME(@cLN ), N'NULL') + N'), '''') + ''|'' +
+                           COALESCE(CONVERT(varchar(30),  i.' + COALESCE(QUOTENAME(@cDOB), N'NULL') + N', 120), '''')
+                       )), ''''),
+                       CONVERT(varchar(36), NEWID())
+                   )
+        FROM inserted i
+    )
+    INSERT INTO ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' (' + @cols + N')
+    SELECT ' + @sel + N'
+    FROM src i
+    CROSS APPLY (SELECT Seed = i.Seed) s;
+END;
+';
+
+EXEC sys.sp_executesql @ddl;
+
+PRINT 'Created trigger: ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@trgName) + N';
+GO
+';
+GO
