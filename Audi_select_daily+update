@@ -1,0 +1,348 @@
++++++1) Create the Daily PHI Report Stored Procedure (TERA)================================
+USE [TERA];
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Email_Daily_PHI_Selects_And_WhereSensitive
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @LookbackHours INT = 24,
+    @MaxRowsAll INT = 500,
+    @MaxRowsWhere INT = 500
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @utc_end   DATETIME2(7) = SYSUTCDATETIME();
+    DECLARE @utc_start DATETIME2(7) = DATEADD(HOUR, -@LookbackHours, @utc_end);
+
+    -- Refresh Tech/Business mapping cache (optional but recommended)
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache;
+
+    /* ===========================
+       A) ALL PHI SELECTs (Human Only)
+       =========================== */
+    ;WITH all_phi AS
+    (
+        SELECT TOP (@MaxRowsAll)
+            a.event_time,
+            a.server_principal_name AS login_name,
+            COALESCE(c.category,'Unknown') AS user_category,
+            c.matched_group,
+            a.schema_name,
+            a.object_name,
+            a.client_ip,
+            a.application_name,
+            a.statement
+        FROM dbo.v_Audit_PHI_Selects a
+        LEFT JOIN dbo.Audit_UserCategoryCache c
+            ON c.login_name = a.server_principal_name
+        WHERE a.event_time >= @utc_start
+          AND a.event_time <  @utc_end
+          AND a.server_principal_name IS NOT NULL
+          AND LTRIM(RTRIM(a.server_principal_name)) <> N''
+          AND a.server_principal_name NOT LIKE 'svc%'
+          AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+          AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+        ORDER BY a.event_time DESC
+    )
+    SELECT *
+    INTO #AllPHI
+    FROM all_phi;
+
+    /* ===========================
+       B) WHERE-sensitive PHI SELECTs (Human Only + keyword + severity)
+       =========================== */
+    ;WITH base AS
+    (
+        SELECT TOP (@MaxRowsWhere)
+            a.event_time,
+            a.server_principal_name AS login_name,
+            COALESCE(c.category,'Unknown') AS user_category,
+            c.matched_group,
+            a.schema_name,
+            a.object_name,
+            a.client_ip,
+            a.application_name,
+            a.statement,
+            LOWER(a.statement) AS stmt_l
+        FROM dbo.v_Audit_PHI_Selects a
+        LEFT JOIN dbo.Audit_UserCategoryCache c
+            ON c.login_name = a.server_principal_name
+        WHERE a.event_time >= @utc_start
+          AND a.event_time <  @utc_end
+          AND a.server_principal_name IS NOT NULL
+          AND LTRIM(RTRIM(a.server_principal_name)) <> N''
+          AND a.server_principal_name NOT LIKE 'svc%'
+          AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+          AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+          AND LOWER(a.statement) LIKE '% where %'
+        ORDER BY a.event_time DESC
+    ),
+    tagged AS
+    (
+        SELECT
+            b.*,
+            sk.keyword AS matched_keyword,
+            SUBSTRING(b.stmt_l, CHARINDEX(' where ', b.stmt_l), 4000) AS where_text,
+            CASE
+              WHEN
+                 (
+                   b.stmt_l LIKE 'select %*%'
+                   OR b.stmt_l LIKE '%select into%'
+                   OR b.stmt_l LIKE '%openrowset%'
+                   OR b.stmt_l LIKE '%bulk%'
+                 )
+                 AND (
+                      b.application_name LIKE '%Management Studio%'
+                   OR b.application_name LIKE '%Excel%'
+                   OR b.application_name LIKE '%Power BI%'
+                   OR b.application_name LIKE '%ODBC%'
+                   OR b.application_name LIKE '%OLE DB%'
+                 )
+              THEN 'POTENTIAL_EXPORT'
+              WHEN b.user_category IN ('Business','Unknown') AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+              WHEN sk.keyword IN ('SSN','DEA','DEANumber')
+                   AND (
+                        b.stmt_l LIKE '% like %'
+                     OR b.stmt_l LIKE '% in (%'
+                     OR b.stmt_l LIKE '% between %'
+                     OR b.stmt_l LIKE '%>=%'
+                     OR b.stmt_l LIKE '%<=%'
+                   )
+              THEN 'HIGH'
+              WHEN b.user_category IN ('Business','Unknown')
+                   AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                      'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+              THEN 'MEDIUM'
+              WHEN b.user_category='Tech' AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+              WHEN b.user_category='Tech'
+                   AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                      'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+              THEN 'LOW'
+              ELSE 'MEDIUM'
+            END AS severity
+        FROM base b
+        OUTER APPLY
+        (
+            SELECT TOP (1) keyword
+            FROM dbo.Audit_SensitiveKeywords
+            WHERE b.stmt_l LIKE '%' + LOWER(keyword) + '%'
+            ORDER BY keyword
+        ) sk
+        WHERE sk.keyword IS NOT NULL
+    )
+    SELECT
+        event_time,
+        login_name,
+        user_category,
+        matched_group,
+        schema_name,
+        object_name,
+        client_ip,
+        application_name,
+        matched_keyword,
+        LEFT(REPLACE(REPLACE(where_text, CHAR(13), ' '), CHAR(10), ' '), 800) AS where_snippet,
+        severity,
+        statement
+    INTO #WhereSensitive
+    FROM tagged;
+
+    /* ===========================
+       HTML formatting (2 sections)
+       =========================== */
+    DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%; table-layout:fixed;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word; white-space:normal;}
+  th{background:#f3f3f3;}
+</style>';
+
+    DECLARE @html NVARCHAR(MAX) =
+        @style
+      + N'<h2>Daily PHI Access Report (Human Only)</h2>'
+      + N'<p><b>Window (UTC):</b> ' + CONVERT(NVARCHAR(30), @utc_start, 126)
+      + N' to ' + CONVERT(NVARCHAR(30), @utc_end, 126) + N'</p>';
+
+    /* Section 1: WHERE-sensitive */
+    SET @html += N'<h3>Section 1: PHI SELECT with WHERE on Sensitive Fields</h3>';
+
+    IF NOT EXISTS (SELECT 1 FROM #WhereSensitive)
+    BEGIN
+        SET @html += N'<p><b>No WHERE-sensitive PHI selects in this window.</b></p>';
+    END
+    ELSE
+    BEGIN
+        SET @html += N'<table><tr>'
+          + N'<th>event_time</th><th>severity</th><th>category</th><th>login</th><th>AD group</th>'
+          + N'<th>object</th><th>client_ip</th><th>application</th><th>keyword</th><th>where_snippet</th>'
+          + N'</tr>';
+
+        SET @html += (
+          SELECT N'<tr>'
+            + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+            + N'<td>' + severity + N'</td>'
+            + N'<td>' + user_category + N'</td>'
+            + N'<td>' + login_name + N'</td>'
+            + N'<td>' + ISNULL(matched_group,N'') + N'</td>'
+            + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+            + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+            + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+            + N'<td>' + ISNULL(matched_keyword,N'') + N'</td>'
+            + N'<td>' + ISNULL(where_snippet,N'') + N'</td>'
+            + N'</tr>'
+          FROM #WhereSensitive
+          ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'POTENTIAL_EXPORT' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 9 END,
+                   event_time DESC
+          FOR XML PATH(''), TYPE
+        ).value('.','nvarchar(max)');
+
+        SET @html += N'</table>';
+    END
+
+    /* Section 2: ALL PHI SELECT */
+    SET @html += N'<h3>Section 2: All PHI SELECT Activity</h3>';
+
+    IF NOT EXISTS (SELECT 1 FROM #AllPHI)
+    BEGIN
+        SET @html += N'<p><b>No PHI selects in this window.</b></p>';
+    END
+    ELSE
+    BEGIN
+        SET @html += N'<table><tr>'
+          + N'<th>event_time</th><th>category</th><th>login</th><th>AD group</th>'
+          + N'<th>object</th><th>client_ip</th><th>application</th><th>statement (short)</th>'
+          + N'</tr>';
+
+        SET @html += (
+          SELECT N'<tr>'
+            + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+            + N'<td>' + user_category + N'</td>'
+            + N'<td>' + login_name + N'</td>'
+            + N'<td>' + ISNULL(matched_group,N'') + N'</td>'
+            + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+            + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+            + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+            + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td>'
+            + N'</tr>'
+          FROM #AllPHI
+          ORDER BY event_time DESC
+          FOR XML PATH(''), TYPE
+        ).value('.','nvarchar(max)');
+
+        SET @html += N'</table>';
+    END
+
+    DECLARE @subject NVARCHAR(200) =
+      N'Daily PHI Access Report - All SELECT + WHERE-Sensitive (UTC ' + CONVERT(NVARCHAR(10), CAST(@utc_start AS DATE), 120) + N')';
+
+    EXEC msdb.dbo.sp_send_dbmail
+      @profile_name = @ProfileName,
+      @recipients   = @Recipients,
+      @subject      = @subject,
+      @body         = @html,
+      @body_format  = 'HTML';
+END
+GO
+
+
+
+++++++++++++++++++++++++++2) Manual run (anytime)++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+USE TERA;
+EXEC dbo.usp_Email_Daily_PHI_Selects_And_WhereSensitive
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'security@company.com;hr@company.com',
+  @LookbackHours = 24,
+  @MaxRowsAll = 1000,
+  @MaxRowsWhere = 1000;
+
+++++++3) Schedule it daily (SQL Agent job)+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+USE msdb;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive')
+BEGIN
+  EXEC msdb.dbo.sp_add_job
+    @job_name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive',
+    @enabled = 1,
+    @description = N'Daily email: PHI SELECT activity + WHERE-sensitive (human only).';
+END
+GO
+
+-- Replace step
+DECLARE @jobId UNIQUEIDENTIFIER;
+SELECT @jobId = job_id FROM msdb.dbo.sysjobs WHERE name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive';
+
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobsteps WHERE job_id=@jobId AND step_name=N'Send Daily Report')
+  EXEC msdb.dbo.sp_delete_jobstep @job_id=@jobId, @step_name=N'Send Daily Report';
+GO
+
+EXEC msdb.dbo.sp_add_jobstep
+  @job_name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive',
+  @step_name = N'Send Daily Report',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'
+EXEC dbo.usp_Email_Daily_PHI_Selects_And_WhereSensitive
+  @ProfileName = N''DBA-Mail'',
+  @Recipients  = N''security@company.com;hr@company.com'',
+  @LookbackHours = 24,
+  @MaxRowsAll = 1000,
+  @MaxRowsWhere = 1000;
+';
+GO
+
+-- Daily schedule 6:00 AM
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysschedules WHERE name = N'Daily_0600')
+BEGIN
+  EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = N'Daily_0600',
+    @freq_type = 4,
+    @freq_interval = 1,
+    @active_start_time = 060000;
+END
+GO
+
+IF NOT EXISTS
+(
+  SELECT 1
+  FROM msdb.dbo.sysjobschedules js
+  JOIN msdb.dbo.sysjobs j ON j.job_id=js.job_id
+  JOIN msdb.dbo.sysschedules s ON s.schedule_id=js.schedule_id
+  WHERE j.name=N'DAILY_TERA_PHI_Selects_And_WhereSensitive'
+    AND s.name=N'Daily_0600'
+)
+BEGIN
+  EXEC msdb.dbo.sp_attach_schedule
+    @job_name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive',
+    @schedule_name = N'Daily_0600';
+END
+GO
+
+IF NOT EXISTS
+(
+  SELECT 1
+  FROM msdb.dbo.sysjobservers js
+  JOIN msdb.dbo.sysjobs j ON j.job_id=js.job_id
+  WHERE j.name=N'DAILY_TERA_PHI_Selects_And_WhereSensitive'
+)
+BEGIN
+  EXEC msdb.dbo.sp_add_jobserver
+    @job_name = N'DAILY_TERA_PHI_Selects_And_WhereSensitive';
+END
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
