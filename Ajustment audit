@@ -1,1 +1,30 @@
+++++++++++++++++++++++Check who truncated the table==========================
+SELECT
+    event_time,
+    action_id,
+    statement,
+    server_principal_name,
+    database_name,
+    schema_name,
+    object_name,
+    application_name,
+    client_ip
+FROM sys.fn_get_audit_file(
+       'E:\SQLAudit\TERA\*.sqlaudit',  -- same path your server audit uses
+       DEFAULT, DEFAULT
+)
+WHERE action_id = 'TR'   -- TRUNCATE
+ORDER BY event_time DESC;
+
+
+
+++++++++++++++++++++++Add DATABASE_OBJECT_CHANGE_GROUP (safe)+++++++++++++++++++++++++++++++++++
+USE TERA;
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_DB_Changes]
+ADD (DATABASE_OBJECT_CHANGE_GROUP);
+GO
+++++++++++++++++++You can reuse your existing alert framework and add:++++++++++++++++++++++++++++++
+WHERE action_id = 'TR'
 
