@@ -36,3 +36,318 @@
     Answer19 VARCHAR(255)
     Answer20 VARCHAR(255)
     /* END MASK THIS FIELD */
+
+
+------------------------------------------------///////////------------------------------------------------------------
+USE [TERA];
+GO
+SET NOCOUNT ON;
+
+UPDATE r
+SET
+    LastName =
+        CASE ABS(CAST(CHECKSUM(s.Seed + '_LN') AS BIGINT)) % 10
+            WHEN 0 THEN 'Smith' WHEN 1 THEN 'Johnson' WHEN 2 THEN 'Williams' WHEN 3 THEN 'Brown' WHEN 4 THEN 'Jones'
+            WHEN 5 THEN 'Garcia' WHEN 6 THEN 'Miller' WHEN 7 THEN 'Davis' WHEN 8 THEN 'Rodriguez' WHEN 9 THEN 'Martinez'
+        END,
+
+    FirstName =
+        CASE ABS(CAST(CHECKSUM(s.Seed + '_FN') AS BIGINT)) % 10
+            WHEN 0 THEN 'James' WHEN 1 THEN 'Mary' WHEN 2 THEN 'John' WHEN 3 THEN 'Patricia' WHEN 4 THEN 'Robert'
+            WHEN 5 THEN 'Linda' WHEN 6 THEN 'Michael' WHEN 7 THEN 'Barbara' WHEN 8 THEN 'David' WHEN 9 THEN 'Elizabeth'
+        END,
+
+    MiddleInt = CHAR(65 + (ABS(CAST(CHECKSUM(s.Seed + '_MI') AS BIGINT)) % 26)),
+
+    Suffix =
+        CASE ABS(CAST(CHECKSUM(s.Seed + '_SUF') AS BIGINT)) % 6
+            WHEN 0 THEN '' WHEN 1 THEN 'Jr' WHEN 2 THEN 'Sr' WHEN 3 THEN 'II' WHEN 4 THEN 'III' WHEN 5 THEN 'IV'
+        END,
+
+    HomePhone = '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(s.Seed + '_HP') AS BIGINT)) % 10000000 AS varchar(7)), 7),
+    WorkPhone = '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(s.Seed + '_WP') AS BIGINT)) % 10000000 AS varchar(7)), 7),
+
+    Address1 =
+        CAST(100 + (ABS(CAST(CHECKSUM(s.Seed + '_A1N') AS BIGINT)) % 9900) AS varchar(5))
+        + ' ' +
+        CASE ABS(CAST(CHECKSUM(s.Seed + '_A1S') AS BIGINT)) % 8
+            WHEN 0 THEN 'Oak St' WHEN 1 THEN 'Maple Ave' WHEN 2 THEN 'Pine Dr' WHEN 3 THEN 'Cedar Ln'
+            WHEN 4 THEN 'Elm St' WHEN 5 THEN 'Sunset Blvd' WHEN 6 THEN 'Ridge Rd' WHEN 7 THEN 'Lakeview Dr'
+        END,
+
+    Address2 =
+        CASE WHEN ABS(CAST(CHECKSUM(s.Seed + '_A2F') AS BIGINT)) % 4 = 0
+             THEN NULL
+             WHEN ABS(CAST(CHECKSUM(s.Seed + '_A2T') AS BIGINT)) % 2 = 0
+             THEN 'Apt ' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + '_APT') AS BIGINT)) % 300) AS varchar(4))
+             ELSE 'Suite ' + CAST(1 + (ABS(CAST(CHECKSUM(s.Seed + '_STE') AS BIGINT)) % 500) AS varchar(4))
+        END,
+
+    -- Normalize State to a 2-letter key (extend as needed)
+    State = st.StateKey,
+
+    -- City matches StateKey
+    City =
+        CASE
+            WHEN st.StateKey = 'NM' THEN
+                CASE ABS(CAST(CHECKSUM(s.Seed + '_CITY_NM') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                    WHEN 4 THEN 'Roswell' WHEN 5 THEN 'Farmington' WHEN 6 THEN 'Clovis' WHEN 7 THEN 'Gallup'
+                END
+            WHEN st.StateKey = 'TX' THEN
+                CASE ABS(CAST(CHECKSUM(s.Seed + '_CITY_TX') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Houston' WHEN 1 THEN 'Dallas' WHEN 2 THEN 'Austin' WHEN 3 THEN 'San Antonio'
+                    WHEN 4 THEN 'Fort Worth' WHEN 5 THEN 'El Paso' WHEN 6 THEN 'Arlington' WHEN 7 THEN 'Plano'
+                END
+            ELSE
+                CASE ABS(CAST(CHECKSUM(s.Seed + '_CITY') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                    WHEN 4 THEN 'Houston' WHEN 5 THEN 'Dallas' WHEN 6 THEN 'Austin' WHEN 7 THEN 'San Antonio'
+                END
+        END,
+
+    PostalCode =
+        RIGHT('00000' + CAST(70000 + (ABS(CAST(CHECKSUM(s.Seed + '_ZIP') AS BIGINT)) % 9999) AS varchar(5)), 5),
+
+    eMailAddress =
+        'user' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_EM') AS BIGINT))), 12) + '@example.com',
+
+    Gender =
+        CASE ABS(CAST(CHECKSUM(s.Seed + '_G') AS BIGINT)) % 4
+            WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' WHEN 3 THEN 'Unknown'
+        END,
+
+    Birthdate =
+        DATEADD(DAY,
+            ABS(CAST(CHECKSUM(s.Seed + '_DOB') AS BIGINT)) % 25550,
+            CONVERT(date, '1940-01-01')
+        ),
+
+    Age =
+        DATEDIFF(YEAR,
+            DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date, '1940-01-01')),
+            CAST(GETDATE() AS date)
+        )
+        - CASE
+            WHEN DATEADD(YEAR,
+                    DATEDIFF(YEAR,
+                        DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+                        CAST(GETDATE() AS date)
+                    ),
+                    DATEADD(DAY, ABS(CAST(CHECKSUM(s.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01'))
+                 ) > CAST(GETDATE() AS date)
+            THEN 1 ELSE 0 END,
+
+    Answer1  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A1')  AS BIGINT))), 12),
+    Answer2  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A2')  AS BIGINT))), 12),
+    Answer3  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A3')  AS BIGINT))), 12),
+    Answer4  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A4')  AS BIGINT))), 12),
+    Answer5  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A5')  AS BIGINT))), 12),
+    Answer6  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A6')  AS BIGINT))), 12),
+    Answer7  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A7')  AS BIGINT))), 12),
+    Answer8  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A8')  AS BIGINT))), 12),
+    Answer9  = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A9')  AS BIGINT))), 12),
+    Answer10 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A10') AS BIGINT))), 12),
+    Answer11 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A11') AS BIGINT))), 12),
+    Answer12 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A12') AS BIGINT))), 12),
+    Answer13 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A13') AS BIGINT))), 12),
+    Answer14 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A14') AS BIGINT))), 12),
+    Answer15 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A15') AS BIGINT))), 12),
+    Answer16 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A16') AS BIGINT))), 12),
+    Answer17 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A17') AS BIGINT))), 12),
+    Answer18 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A18') AS BIGINT))), 12),
+    Answer19 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A19') AS BIGINT))), 12),
+    Answer20 = 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(s.Seed + '_A20') AS BIGINT))), 12)
+FROM [B_carenet].[CARENET_rosters] r
+CROSS APPLY (
+    SELECT Seed =
+        COALESCE(
+            NULLIF(LTRIM(RTRIM(
+                COALESCE(r.eMailAddress,'') + '|' +
+                COALESCE(r.HomePhone,'')    + '|' +
+                COALESCE(r.WorkPhone,'')    + '|' +
+                COALESCE(r.LastName,'')     + '|' +
+                COALESCE(r.FirstName,'')    + '|' +
+                COALESCE(CONVERT(varchar(10), r.Birthdate, 120),'')
+            )), ''),
+            CONVERT(varchar(36), NEWID())
+        )
+) s
+CROSS APPLY (
+    SELECT StateKey =
+        CASE
+            WHEN r.State IS NULL OR LTRIM(RTRIM(r.State)) = '' THEN 'NM'
+            ELSE
+                CASE UPPER(LTRIM(RTRIM(r.State)))
+                    WHEN 'NEW MEXICO' THEN 'NM' WHEN 'NM' THEN 'NM'
+                    WHEN 'TEXAS' THEN 'TX' WHEN 'TX' THEN 'TX'
+                    ELSE UPPER(LEFT(LTRIM(RTRIM(r.State)), 2))
+                END
+        END
+) st;
+GO
+
+
+
+
++++++++++++++++++++Trigger++++++++++++++++++++++++++++++++++++++++++++++++++++
+USE [TERA];
+GO
+
+IF OBJECT_ID(N'[B_carenet].[trg_CARENET_rosters_StaticMask_INS]', 'TR') IS NOT NULL
+    DROP TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_INS];
+GO
+
+CREATE TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_INS]
+ON [B_carenet].[CARENET_rosters]
+INSTEAD OF INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ;WITH src AS (
+        SELECT
+            i.*,
+            Seed =
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(
+                        COALESCE(i.eMailAddress,'') + '|' +
+                        COALESCE(i.HomePhone,'')    + '|' +
+                        COALESCE(i.WorkPhone,'')    + '|' +
+                        COALESCE(i.LastName,'')     + '|' +
+                        COALESCE(i.FirstName,'')    + '|' +
+                        COALESCE(CONVERT(varchar(10), i.Birthdate, 120),'')
+                    )), ''),
+                    CONVERT(varchar(36), NEWID())
+                )
+        FROM inserted i
+    ),
+    st AS (
+        SELECT
+            s.*,
+            StateKey =
+                CASE
+                    WHEN s.State IS NULL OR LTRIM(RTRIM(s.State)) = '' THEN 'NM'
+                    ELSE
+                        CASE UPPER(LTRIM(RTRIM(s.State)))
+                            WHEN 'NEW MEXICO' THEN 'NM' WHEN 'NM' THEN 'NM'
+                            WHEN 'TEXAS' THEN 'TX' WHEN 'TX' THEN 'TX'
+                            ELSE UPPER(LEFT(LTRIM(RTRIM(s.State)), 2))
+                        END
+                END
+        FROM src s
+    )
+    INSERT INTO [B_carenet].[CARENET_rosters] (
+        LastName, FirstName, MiddleInt, Suffix,
+        HomePhone, WorkPhone,
+        Address1, Address2, City, State, PostalCode,
+        eMailAddress, Gender, Birthdate, Age,
+        Answer1, Answer2, Answer3, Answer4, Answer5,
+        Answer6, Answer7, Answer8, Answer9, Answer10,
+        Answer11, Answer12, Answer13, Answer14, Answer15,
+        Answer16, Answer17, Answer18, Answer19, Answer20
+    )
+    SELECT
+        -- Names
+        CASE ABS(CAST(CHECKSUM(Seed + '_LN') AS BIGINT)) % 10
+            WHEN 0 THEN 'Smith' WHEN 1 THEN 'Johnson' WHEN 2 THEN 'Williams' WHEN 3 THEN 'Brown' WHEN 4 THEN 'Jones'
+            WHEN 5 THEN 'Garcia' WHEN 6 THEN 'Miller' WHEN 7 THEN 'Davis' WHEN 8 THEN 'Rodriguez' WHEN 9 THEN 'Martinez'
+        END AS LastName,
+
+        CASE ABS(CAST(CHECKSUM(Seed + '_FN') AS BIGINT)) % 10
+            WHEN 0 THEN 'James' WHEN 1 THEN 'Mary' WHEN 2 THEN 'John' WHEN 3 THEN 'Patricia' WHEN 4 THEN 'Robert'
+            WHEN 5 THEN 'Linda' WHEN 6 THEN 'Michael' WHEN 7 THEN 'Barbara' WHEN 8 THEN 'David' WHEN 9 THEN 'Elizabeth'
+        END AS FirstName,
+
+        CHAR(65 + (ABS(CAST(CHECKSUM(Seed + '_MI') AS BIGINT)) % 26)) AS MiddleInt,
+
+        CASE ABS(CAST(CHECKSUM(Seed + '_SUF') AS BIGINT)) % 6
+            WHEN 0 THEN '' WHEN 1 THEN 'Jr' WHEN 2 THEN 'Sr' WHEN 3 THEN 'II' WHEN 4 THEN 'III' WHEN 5 THEN 'IV'
+        END AS Suffix,
+
+        -- Phones
+        '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(Seed + '_HP') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS HomePhone,
+        '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(Seed + '_WP') AS BIGINT)) % 10000000 AS varchar(7)), 7) AS WorkPhone,
+
+        -- Addresses
+        CAST(100 + (ABS(CAST(CHECKSUM(Seed + '_A1N') AS BIGINT)) % 9900) AS varchar(5))
+        + ' ' +
+        CASE ABS(CAST(CHECKSUM(Seed + '_A1S') AS BIGINT)) % 8
+            WHEN 0 THEN 'Oak St' WHEN 1 THEN 'Maple Ave' WHEN 2 THEN 'Pine Dr' WHEN 3 THEN 'Cedar Ln'
+            WHEN 4 THEN 'Elm St' WHEN 5 THEN 'Sunset Blvd' WHEN 6 THEN 'Ridge Rd' WHEN 7 THEN 'Lakeview Dr'
+        END AS Address1,
+
+        CASE WHEN ABS(CAST(CHECKSUM(Seed + '_A2F') AS BIGINT)) % 4 = 0
+             THEN NULL
+             WHEN ABS(CAST(CHECKSUM(Seed + '_A2T') AS BIGINT)) % 2 = 0
+             THEN 'Apt ' + CAST(1 + (ABS(CAST(CHECKSUM(Seed + '_APT') AS BIGINT)) % 300) AS varchar(4))
+             ELSE 'Suite ' + CAST(1 + (ABS(CAST(CHECKSUM(Seed + '_STE') AS BIGINT)) % 500) AS varchar(4))
+        END AS Address2,
+
+        -- City matches StateKey
+        CASE
+            WHEN StateKey = 'NM' THEN
+                CASE ABS(CAST(CHECKSUM(Seed + '_CITY_NM') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                    WHEN 4 THEN 'Roswell' WHEN 5 THEN 'Farmington' WHEN 6 THEN 'Clovis' WHEN 7 THEN 'Gallup'
+                END
+            WHEN StateKey = 'TX' THEN
+                CASE ABS(CAST(CHECKSUM(Seed + '_CITY_TX') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Houston' WHEN 1 THEN 'Dallas' WHEN 2 THEN 'Austin' WHEN 3 THEN 'San Antonio'
+                    WHEN 4 THEN 'Fort Worth' WHEN 5 THEN 'El Paso' WHEN 6 THEN 'Arlington' WHEN 7 THEN 'Plano'
+                END
+            ELSE
+                CASE ABS(CAST(CHECKSUM(Seed + '_CITY') AS BIGINT)) % 8
+                    WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                    WHEN 4 THEN 'Houston' WHEN 5 THEN 'Dallas' WHEN 6 THEN 'Austin' WHEN 7 THEN 'San Antonio'
+                END
+        END AS City,
+
+        -- Store normalized state
+        StateKey AS State,
+
+        RIGHT('00000' + CAST(70000 + (ABS(CAST(CHECKSUM(Seed + '_ZIP') AS BIGINT)) % 9999) AS varchar(5)), 5) AS PostalCode,
+
+        -- Email/Gender/DOB/Age
+        'user' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_EM') AS BIGINT))), 12) + '@example.com' AS eMailAddress,
+
+        CASE ABS(CAST(CHECKSUM(Seed + '_G') AS BIGINT)) % 4
+            WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' WHEN 3 THEN 'Unknown'
+        END AS Gender,
+
+        bd.MaskedBirthdate AS Birthdate,
+
+        DATEDIFF(YEAR, bd.MaskedBirthdate, CAST(GETDATE() AS date))
+        - CASE WHEN DATEADD(YEAR, DATEDIFF(YEAR, bd.MaskedBirthdate, CAST(GETDATE() AS date)), bd.MaskedBirthdate) > CAST(GETDATE() AS date)
+               THEN 1 ELSE 0 END AS Age,
+
+        -- Answers 1-20
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A1')  AS BIGINT))), 12) AS Answer1,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A2')  AS BIGINT))), 12) AS Answer2,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A3')  AS BIGINT))), 12) AS Answer3,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A4')  AS BIGINT))), 12) AS Answer4,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A5')  AS BIGINT))), 12) AS Answer5,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A6')  AS BIGINT))), 12) AS Answer6,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A7')  AS BIGINT))), 12) AS Answer7,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A8')  AS BIGINT))), 12) AS Answer8,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A9')  AS BIGINT))), 12) AS Answer9,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A10') AS BIGINT))), 12) AS Answer10,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A11') AS BIGINT))), 12) AS Answer11,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A12') AS BIGINT))), 12) AS Answer12,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A13') AS BIGINT))), 12) AS Answer13,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A14') AS BIGINT))), 12) AS Answer14,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A15') AS BIGINT))), 12) AS Answer15,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A16') AS BIGINT))), 12) AS Answer16,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A17') AS BIGINT))), 12) AS Answer17,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A18') AS BIGINT))), 12) AS Answer18,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A19') AS BIGINT))), 12) AS Answer19,
+        'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(Seed + '_A20') AS BIGINT))), 12) AS Answer20
+    FROM st
+    CROSS APPLY (
+        SELECT MaskedBirthdate =
+            DATEADD(DAY, ABS(CAST(CHECKSUM(Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01'))
+    ) bd;
+END;
+GO
+
+
