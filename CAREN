@@ -1,0 +1,37 @@
+/* START MASK THIS FIELD */
+    LastName VARCHAR(80),
+    FirstName VARCHAR(80),
+    MiddleInt VARCHAR(8),
+    Suffix VARCHAR(8),
+    HomePhone VARCHAR(20),
+    WorkPhone VARCHAR(20),
+    Address1 VARCHAR(80),
+    Address2 VARCHAR(80),
+    City VARCHAR(80),
+    State VARCHAR(10),
+    PostalCode VARCHAR(10),
+    eMailAddress VARCHAR(254),
+    Gender VARCHAR(8),
+    Birthdate DATE,
+    Age INT,
+    Answer1 VARCHAR(255)
+    Answer2 VARCHAR(255)
+    Answer3 VARCHAR(255)
+    Answer4 VARCHAR(255)
+    Answer5 VARCHAR(255)
+    Answer6 VARCHAR(255)
+    Answer7 VARCHAR(255)
+    Answer8 VARCHAR(255)
+    Answer9 VARCHAR(255)
+    Answer10 VARCHAR(255)
+    Answer11 VARCHAR(255)
+    Answer12 VARCHAR(255)
+    Answer13 VARCHAR(255)
+    Answer14 VARCHAR(255)
+    Answer15 VARCHAR(255)
+    Answer16 VARCHAR(255)
+    Answer17 VARCHAR(255)
+    Answer18 VARCHAR(255)
+    Answer19 VARCHAR(255)
+    Answer20 VARCHAR(255)
+    /* END MASK THIS FIELD */
