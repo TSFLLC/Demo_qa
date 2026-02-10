@@ -1,4 +1,5 @@
 /* START MASK THIS FIELD */
+[TERA].[B_carenet].[CARENET_rosters]
     LastName VARCHAR(80),
     FirstName VARCHAR(80),
     MiddleInt VARCHAR(8),
