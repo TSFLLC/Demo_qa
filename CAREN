@@ -611,3 +611,9 @@ ORDER BY t.name;
 +++++++++++++++++++++
 SELECT OBJECT_DEFINITION(OBJECT_ID(N'[B_carenet].[trg_CARENET_rosters_StaticMask_UPD]')) AS TriggerDefinition;
 
+
+================================//////===================================
+
+Not masking NULL/None/Empty String data.
+HIPAAtizer Updates
+
