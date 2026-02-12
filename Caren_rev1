@@ -528,3 +528,46 @@ BEGIN
 END;
 GO
 
+
+
++++++++++++++++++++++++++++++++++++++++++++++++//////+++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Very important (about UPSERT keys)
+
+Your dev said “upsert” (not MERGE). That usually means:
+
+UPDATE ... WHERE <BusinessKey>
+
+IF @@ROWCOUNT = 0 INSERT ...
+
+In that pattern, the UPDATE statement does not always include RowID, and often RowID is not known.
+
+✅ If their UPDATE does not set RowID, then this line in the update trigger:
+
+JOIN st i ON tgt.RowID = i.RowID
+
+
+can cause masking to be skipped or not apply.
+
+Best solution
+
+Change the join key to the same key they use in their upsert UPDATE (commonly ClassID + EnrolleeID, or EnrolleeID).
+
+If you already know the key, tell me and I’ll rewrite the UPDATE trigger join line exactly.
+
+For example (common):
+
+JOIN st i
+  ON tgt.ClassID = i.ClassID
+ AND tgt.EnrolleeID = i.EnrolleeID
+
+Quick thing you can do right now
+
+Ask your developer to paste just this part of their upsert:
+
+The WHERE clause in the UPDATE, or
+
+The keys they use to match a record
+
+Then I’ll give you the final update trigger with the correct join so it will work 100%.
+
