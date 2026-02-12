@@ -592,3 +592,22 @@ END;
 GO
 
 
+
++++++++++++++++++++++++++++++test if both exist====
+
+SELECT
+    t.name AS TriggerName,
+    s.name AS TriggerSchema,
+    tr.type_desc,
+    OBJECT_NAME(tr.parent_id) AS TableName,
+    OBJECT_SCHEMA_NAME(tr.parent_id) AS TableSchema,
+    tr.is_disabled
+FROM sys.triggers tr
+JOIN sys.objects t ON tr.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE tr.parent_id = OBJECT_ID(N'[B_carenet].[CARENET_rosters]')
+ORDER BY t.name;
+
++++++++++++++++++++++
+SELECT OBJECT_DEFINITION(OBJECT_ID(N'[B_carenet].[trg_CARENET_rosters_StaticMask_UPD]')) AS TriggerDefinition;
+
