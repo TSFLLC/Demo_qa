@@ -1,0 +1,530 @@
+USE [TERA];
+GO
+
+IF OBJECT_ID(N'[B_carenet].[trg_CARENET_rosters_StaticMask_INS]', 'TR') IS NOT NULL
+    DROP TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_INS];
+GO
+
+CREATE TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_INS]
+ON [B_carenet].[CARENET_rosters]
+INSTEAD OF INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ;WITH src AS (
+        SELECT
+            i.*,
+            Seed =
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.eMailAddress)), ''), '') + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.HomePhone)), ''), '')    + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.WorkPhone)), ''), '')    + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.LastName)), ''), '')     + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.FirstName)), ''), '')    + '|' +
+                        COALESCE(CONVERT(varchar(10), i.Birthdate, 120), '')
+                    )), ''),
+                    CONVERT(varchar(36), NEWID())
+                )
+        FROM inserted i
+    ),
+    st AS (
+        SELECT
+            s.*,
+            StateKey =
+                CASE
+                    WHEN s.State IS NULL OR NULLIF(LTRIM(RTRIM(s.State)), '') IS NULL
+                         OR UPPER(LTRIM(RTRIM(s.State))) IN ('NONE','NULL','N/A','NA')
+                    THEN NULL
+                    ELSE
+                        CASE UPPER(LTRIM(RTRIM(s.State)))
+                            WHEN 'NEW MEXICO' THEN 'NM' WHEN 'NM' THEN 'NM'
+                            WHEN 'TEXAS'      THEN 'TX' WHEN 'TX' THEN 'TX'
+                            ELSE UPPER(LEFT(LTRIM(RTRIM(s.State)), 2))
+                        END
+                END
+        FROM src s
+    )
+    INSERT INTO [B_carenet].[CARENET_rosters] (
+        -- RowID excluded (assumed IDENTITY)
+
+        [ClassID],[ClassName],[Location],[ClassAddress],[Room],[Department],
+        [ClassStart],[ClassEnd],[Instructor],[AccessPoint],
+        [EnrollmentDate],[EnrolleeID],
+
+        [LastName],[FirstName],[MiddleInt],[Suffix],
+        [HomePhone],[WorkPhone],
+        [Address1],[Address2],[City],[State],[PostalCode],
+        [eMailAddress],[Gender],[Birthdate],[Age],
+
+        [HowHeardMediaType],[HowHeardMediaSource],[WarmTransfer],[SpanishRequired],
+        [Fee],[DiscountDesc],[DiscountAmount],[FinalAmount],[PaymentMethod],
+
+        [Question1],[Answer1],[Question2],[Answer2],[Question3],[Answer3],[Question4],[Answer4],[Question5],[Answer5],
+        [Question6],[Answer6],[Question7],[Answer7],[Question8],[Answer8],[Question9],[Answer9],[Question10],[Answer10],
+        [Question11],[Answer11],[Question12],[Answer12],[Question13],[Answer13],[Question14],[Answer14],[Question15],[Answer15],
+        [Question16],[Answer16],[Question17],[Answer17],[Question18],[Answer18],[Question19],[Answer19],[Question20],[Answer20]
+    )
+    SELECT
+        -- PASS-THROUGH (non-masked)
+        i.[ClassID], i.[ClassName], i.[Location], i.[ClassAddress], i.[Room], i.[Department],
+        i.[ClassStart], i.[ClassEnd], i.[Instructor], i.[AccessPoint],
+        i.[EnrollmentDate], i.[EnrolleeID],
+
+        -- MASK only if present
+        CASE WHEN i.LastName IS NULL OR NULLIF(LTRIM(RTRIM(i.LastName)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.LastName))) IN ('NONE','NULL','N/A','NA')
+             THEN i.LastName
+             ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_LN') AS BIGINT)) % 10
+                    WHEN 0 THEN 'Smith' WHEN 1 THEN 'Johnson' WHEN 2 THEN 'Williams' WHEN 3 THEN 'Brown' WHEN 4 THEN 'Jones'
+                    WHEN 5 THEN 'Garcia' WHEN 6 THEN 'Miller' WHEN 7 THEN 'Davis' WHEN 8 THEN 'Rodriguez' WHEN 9 THEN 'Martinez'
+                  END
+        END AS [LastName],
+
+        CASE WHEN i.FirstName IS NULL OR NULLIF(LTRIM(RTRIM(i.FirstName)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.FirstName))) IN ('NONE','NULL','N/A','NA')
+             THEN i.FirstName
+             ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_FN') AS BIGINT)) % 10
+                    WHEN 0 THEN 'James' WHEN 1 THEN 'Mary' WHEN 2 THEN 'John' WHEN 3 THEN 'Patricia' WHEN 4 THEN 'Robert'
+                    WHEN 5 THEN 'Linda' WHEN 6 THEN 'Michael' WHEN 7 THEN 'Barbara' WHEN 8 THEN 'David' WHEN 9 THEN 'Elizabeth'
+                  END
+        END AS [FirstName],
+
+        CASE WHEN i.MiddleInt IS NULL OR NULLIF(LTRIM(RTRIM(i.MiddleInt)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.MiddleInt))) IN ('NONE','NULL','N/A','NA')
+             THEN i.MiddleInt
+             ELSE CHAR(65 + (ABS(CAST(CHECKSUM(i.Seed + '_MI') AS BIGINT)) % 26))
+        END AS [MiddleInt],
+
+        CASE WHEN i.Suffix IS NULL OR NULLIF(LTRIM(RTRIM(i.Suffix)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.Suffix))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Suffix
+             ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_SUF') AS BIGINT)) % 6
+                    WHEN 0 THEN '' WHEN 1 THEN 'Jr' WHEN 2 THEN 'Sr' WHEN 3 THEN 'II' WHEN 4 THEN 'III' WHEN 5 THEN 'IV'
+                  END
+        END AS [Suffix],
+
+        CASE WHEN i.HomePhone IS NULL OR NULLIF(LTRIM(RTRIM(i.HomePhone)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.HomePhone))) IN ('NONE','NULL','N/A','NA')
+             THEN i.HomePhone
+             ELSE '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(i.Seed + '_HP') AS BIGINT)) % 10000000 AS varchar(7)), 7)
+        END AS [HomePhone],
+
+        CASE WHEN i.WorkPhone IS NULL OR NULLIF(LTRIM(RTRIM(i.WorkPhone)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.WorkPhone))) IN ('NONE','NULL','N/A','NA')
+             THEN i.WorkPhone
+             ELSE '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(i.Seed + '_WP') AS BIGINT)) % 10000000 AS varchar(7)), 7)
+        END AS [WorkPhone],
+
+        CASE WHEN i.Address1 IS NULL OR NULLIF(LTRIM(RTRIM(i.Address1)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.Address1))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Address1
+             ELSE CAST(100 + (ABS(CAST(CHECKSUM(i.Seed + '_A1N') AS BIGINT)) % 9900) AS varchar(5)) + ' ' +
+                  CASE ABS(CAST(CHECKSUM(i.Seed + '_A1S') AS BIGINT)) % 8
+                      WHEN 0 THEN 'Oak St' WHEN 1 THEN 'Maple Ave' WHEN 2 THEN 'Pine Dr' WHEN 3 THEN 'Cedar Ln'
+                      WHEN 4 THEN 'Elm St' WHEN 5 THEN 'Sunset Blvd' WHEN 6 THEN 'Ridge Rd' WHEN 7 THEN 'Lakeview Dr'
+                  END
+        END AS [Address1],
+
+        CASE WHEN i.Address2 IS NULL OR NULLIF(LTRIM(RTRIM(i.Address2)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.Address2))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Address2
+             ELSE CASE WHEN ABS(CAST(CHECKSUM(i.Seed + '_A2F') AS BIGINT)) % 4 = 0 THEN NULL
+                       WHEN ABS(CAST(CHECKSUM(i.Seed + '_A2T') AS BIGINT)) % 2 = 0
+                            THEN 'Apt ' + CAST(1 + (ABS(CAST(CHECKSUM(i.Seed + '_APT') AS BIGINT)) % 300) AS varchar(4))
+                       ELSE 'Suite ' + CAST(1 + (ABS(CAST(CHECKSUM(i.Seed + '_STE') AS BIGINT)) % 500) AS varchar(4))
+                  END
+        END AS [Address2],
+
+        CASE WHEN i.City IS NULL OR NULLIF(LTRIM(RTRIM(i.City)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.City))) IN ('NONE','NULL','N/A','NA')
+             THEN i.City
+             ELSE
+                CASE
+                    WHEN i.StateKey = 'NM' THEN
+                        CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY_NM') AS BIGINT)) % 8
+                            WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                            WHEN 4 THEN 'Roswell' WHEN 5 THEN 'Farmington' WHEN 6 THEN 'Clovis' WHEN 7 THEN 'Gallup'
+                        END
+                    WHEN i.StateKey = 'TX' THEN
+                        CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY_TX') AS BIGINT)) % 8
+                            WHEN 0 THEN 'Houston' WHEN 1 THEN 'Dallas' WHEN 2 THEN 'Austin' WHEN 3 THEN 'San Antonio'
+                            WHEN 4 THEN 'Fort Worth' WHEN 5 THEN 'El Paso' WHEN 6 THEN 'Arlington' WHEN 7 THEN 'Plano'
+                        END
+                    ELSE
+                        CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY') AS BIGINT)) % 8
+                            WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                            WHEN 4 THEN 'Houston' WHEN 5 THEN 'Dallas' WHEN 6 THEN 'Austin' WHEN 7 THEN 'San Antonio'
+                        END
+                END
+        END AS [City],
+
+        CASE WHEN i.State IS NULL OR NULLIF(LTRIM(RTRIM(i.State)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.State))) IN ('NONE','NULL','N/A','NA')
+             THEN i.State
+             ELSE i.StateKey
+        END AS [State],
+
+        CASE WHEN i.PostalCode IS NULL OR NULLIF(LTRIM(RTRIM(i.PostalCode)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.PostalCode))) IN ('NONE','NULL','N/A','NA')
+             THEN i.PostalCode
+             ELSE RIGHT('00000' + CAST(70000 + (ABS(CAST(CHECKSUM(i.Seed + '_ZIP') AS BIGINT)) % 9999) AS varchar(5)), 5)
+        END AS [PostalCode],
+
+        CASE WHEN i.eMailAddress IS NULL OR NULLIF(LTRIM(RTRIM(i.eMailAddress)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.eMailAddress))) IN ('NONE','NULL','N/A','NA')
+             THEN i.eMailAddress
+             ELSE 'user' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_EM') AS BIGINT))), 12) + '@example.com'
+        END AS [eMailAddress],
+
+        CASE WHEN i.Gender IS NULL OR NULLIF(LTRIM(RTRIM(i.Gender)), '') IS NULL
+                  OR UPPER(LTRIM(RTRIM(i.Gender))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Gender
+             ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_G') AS BIGINT)) % 4
+                    WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' WHEN 3 THEN 'Unknown'
+                  END
+        END AS [Gender],
+
+        CASE WHEN i.Birthdate IS NULL THEN NULL ELSE bd.MaskedBirthdate END AS [Birthdate],
+        CASE WHEN i.Birthdate IS NULL THEN NULL ELSE bd.MaskedAge END AS [Age],
+
+        -- PASS-THROUGH
+        i.[HowHeardMediaType], i.[HowHeardMediaSource], i.[WarmTransfer], i.[SpanishRequired],
+        i.[Fee], i.[DiscountDesc], i.[DiscountAmount], i.[FinalAmount], i.[PaymentMethod],
+
+        -- Questions pass-through, Answers mask-if-present
+        i.[Question1],
+        CASE WHEN i.Answer1 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer1)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer1))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer1 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A1') AS BIGINT))), 12) END,
+        i.[Question2],
+        CASE WHEN i.Answer2 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer2)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer2))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer2 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A2') AS BIGINT))), 12) END,
+        i.[Question3],
+        CASE WHEN i.Answer3 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer3)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer3))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer3 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A3') AS BIGINT))), 12) END,
+        i.[Question4],
+        CASE WHEN i.Answer4 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer4)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer4))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer4 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A4') AS BIGINT))), 12) END,
+        i.[Question5],
+        CASE WHEN i.Answer5 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer5)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer5))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer5 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A5') AS BIGINT))), 12) END,
+        i.[Question6],
+        CASE WHEN i.Answer6 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer6)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer6))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer6 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A6') AS BIGINT))), 12) END,
+        i.[Question7],
+        CASE WHEN i.Answer7 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer7)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer7))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer7 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A7') AS BIGINT))), 12) END,
+        i.[Question8],
+        CASE WHEN i.Answer8 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer8)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer8))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer8 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A8') AS BIGINT))), 12) END,
+        i.[Question9],
+        CASE WHEN i.Answer9 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer9)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer9))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer9 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A9') AS BIGINT))), 12) END,
+        i.[Question10],
+        CASE WHEN i.Answer10 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer10)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer10))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer10 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A10') AS BIGINT))), 12) END,
+        i.[Question11],
+        CASE WHEN i.Answer11 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer11)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer11))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer11 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A11') AS BIGINT))), 12) END,
+        i.[Question12],
+        CASE WHEN i.Answer12 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer12)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer12))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer12 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A12') AS BIGINT))), 12) END,
+        i.[Question13],
+        CASE WHEN i.Answer13 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer13)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer13))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer13 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A13') AS BIGINT))), 12) END,
+        i.[Question14],
+        CASE WHEN i.Answer14 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer14)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer14))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer14 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A14') AS BIGINT))), 12) END,
+        i.[Question15],
+        CASE WHEN i.Answer15 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer15)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer15))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer15 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A15') AS BIGINT))), 12) END,
+        i.[Question16],
+        CASE WHEN i.Answer16 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer16)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer16))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer16 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A16') AS BIGINT))), 12) END,
+        i.[Question17],
+        CASE WHEN i.Answer17 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer17)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer17))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer17 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A17') AS BIGINT))), 12) END,
+        i.[Question18],
+        CASE WHEN i.Answer18 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer18)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer18))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer18 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A18') AS BIGINT))), 12) END,
+        i.[Question19],
+        CASE WHEN i.Answer19 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer19)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer19))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer19 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A19') AS BIGINT))), 12) END,
+        i.[Question20],
+        CASE WHEN i.Answer20 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer20)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer20))) IN ('NONE','NULL','N/A','NA')
+             THEN i.Answer20 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A20') AS BIGINT))), 12) END
+    FROM st i
+    CROSS APPLY (
+        SELECT
+            MaskedBirthdate = DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+            MaskedAge =
+                DATEDIFF(YEAR,
+                    DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+                    CAST(GETDATE() AS date)
+                )
+                - CASE WHEN DATEADD(YEAR,
+                        DATEDIFF(YEAR,
+                            DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+                            CAST(GETDATE() AS date)
+                        ),
+                        DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01'))
+                    ) > CAST(GETDATE() AS date)
+                    THEN 1 ELSE 0 END
+    ) bd;
+END;
+GO
+
+
+
++++++++++++++++++++++++++++++++++++++++++++////////////+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+USE [TERA];
+GO
+
+IF OBJECT_ID(N'[B_carenet].[trg_CARENET_rosters_StaticMask_UPD]', 'TR') IS NOT NULL
+    DROP TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_UPD];
+GO
+
+CREATE TRIGGER [B_carenet].[trg_CARENET_rosters_StaticMask_UPD]
+ON [B_carenet].[CARENET_rosters]
+INSTEAD OF UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ;WITH src AS (
+        SELECT
+            i.*,
+            Seed =
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.eMailAddress)), ''), '') + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.HomePhone)), ''), '')    + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.WorkPhone)), ''), '')    + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.LastName)), ''), '')     + '|' +
+                        COALESCE(NULLIF(LTRIM(RTRIM(i.FirstName)), ''), '')    + '|' +
+                        COALESCE(CONVERT(varchar(10), i.Birthdate, 120), '')
+                    )), ''),
+                    CONVERT(varchar(36), NEWID())
+                )
+        FROM inserted i
+    ),
+    st AS (
+        SELECT
+            s.*,
+            StateKey =
+                CASE
+                    WHEN s.State IS NULL OR NULLIF(LTRIM(RTRIM(s.State)), '') IS NULL
+                         OR UPPER(LTRIM(RTRIM(s.State))) IN ('NONE','NULL','N/A','NA')
+                    THEN NULL
+                    ELSE
+                        CASE UPPER(LTRIM(RTRIM(s.State)))
+                            WHEN 'NEW MEXICO' THEN 'NM' WHEN 'NM' THEN 'NM'
+                            WHEN 'TEXAS'      THEN 'TX' WHEN 'TX' THEN 'TX'
+                            ELSE UPPER(LEFT(LTRIM(RTRIM(s.State)), 2))
+                        END
+                END
+        FROM src s
+    )
+    UPDATE tgt
+    SET
+        -- PASS-THROUGH (non-masked)
+        tgt.ClassID = i.ClassID,
+        tgt.ClassName = i.ClassName,
+        tgt.Location = i.Location,
+        tgt.ClassAddress = i.ClassAddress,
+        tgt.Room = i.Room,
+        tgt.Department = i.Department,
+        tgt.ClassStart = i.ClassStart,
+        tgt.ClassEnd = i.ClassEnd,
+        tgt.Instructor = i.Instructor,
+        tgt.AccessPoint = i.AccessPoint,
+        tgt.EnrollmentDate = i.EnrollmentDate,
+        tgt.EnrolleeID = i.EnrolleeID,
+        tgt.HowHeardMediaType = i.HowHeardMediaType,
+        tgt.HowHeardMediaSource = i.HowHeardMediaSource,
+        tgt.WarmTransfer = i.WarmTransfer,
+        tgt.SpanishRequired = i.SpanishRequired,
+        tgt.Fee = i.Fee,
+        tgt.DiscountDesc = i.DiscountDesc,
+        tgt.DiscountAmount = i.DiscountAmount,
+        tgt.FinalAmount = i.FinalAmount,
+        tgt.PaymentMethod = i.PaymentMethod,
+        tgt.Question1 = i.Question1,  tgt.Question2 = i.Question2,  tgt.Question3 = i.Question3,  tgt.Question4 = i.Question4,  tgt.Question5 = i.Question5,
+        tgt.Question6 = i.Question6,  tgt.Question7 = i.Question7,  tgt.Question8 = i.Question8,  tgt.Question9 = i.Question9,  tgt.Question10 = i.Question10,
+        tgt.Question11 = i.Question11, tgt.Question12 = i.Question12, tgt.Question13 = i.Question13, tgt.Question14 = i.Question14, tgt.Question15 = i.Question15,
+        tgt.Question16 = i.Question16, tgt.Question17 = i.Question17, tgt.Question18 = i.Question18, tgt.Question19 = i.Question19, tgt.Question20 = i.Question20,
+
+        -- MASKED (skip blanks)
+        tgt.LastName =
+            CASE WHEN i.LastName IS NULL OR NULLIF(LTRIM(RTRIM(i.LastName)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.LastName))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.LastName
+                 ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_LN') AS BIGINT)) % 10
+                        WHEN 0 THEN 'Smith' WHEN 1 THEN 'Johnson' WHEN 2 THEN 'Williams' WHEN 3 THEN 'Brown' WHEN 4 THEN 'Jones'
+                        WHEN 5 THEN 'Garcia' WHEN 6 THEN 'Miller' WHEN 7 THEN 'Davis' WHEN 8 THEN 'Rodriguez' WHEN 9 THEN 'Martinez'
+                      END
+            END,
+
+        tgt.FirstName =
+            CASE WHEN i.FirstName IS NULL OR NULLIF(LTRIM(RTRIM(i.FirstName)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.FirstName))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.FirstName
+                 ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_FN') AS BIGINT)) % 10
+                        WHEN 0 THEN 'James' WHEN 1 THEN 'Mary' WHEN 2 THEN 'John' WHEN 3 THEN 'Patricia' WHEN 4 THEN 'Robert'
+                        WHEN 5 THEN 'Linda' WHEN 6 THEN 'Michael' WHEN 7 THEN 'Barbara' WHEN 8 THEN 'David' WHEN 9 THEN 'Elizabeth'
+                      END
+            END,
+
+        tgt.MiddleInt =
+            CASE WHEN i.MiddleInt IS NULL OR NULLIF(LTRIM(RTRIM(i.MiddleInt)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.MiddleInt))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.MiddleInt
+                 ELSE CHAR(65 + (ABS(CAST(CHECKSUM(i.Seed + '_MI') AS BIGINT)) % 26))
+            END,
+
+        tgt.Suffix =
+            CASE WHEN i.Suffix IS NULL OR NULLIF(LTRIM(RTRIM(i.Suffix)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.Suffix))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.Suffix
+                 ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_SUF') AS BIGINT)) % 6
+                        WHEN 0 THEN '' WHEN 1 THEN 'Jr' WHEN 2 THEN 'Sr' WHEN 3 THEN 'II' WHEN 4 THEN 'III' WHEN 5 THEN 'IV'
+                      END
+            END,
+
+        tgt.HomePhone =
+            CASE WHEN i.HomePhone IS NULL OR NULLIF(LTRIM(RTRIM(i.HomePhone)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.HomePhone))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.HomePhone
+                 ELSE '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(i.Seed + '_HP') AS BIGINT)) % 10000000 AS varchar(7)), 7)
+            END,
+
+        tgt.WorkPhone =
+            CASE WHEN i.WorkPhone IS NULL OR NULLIF(LTRIM(RTRIM(i.WorkPhone)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.WorkPhone))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.WorkPhone
+                 ELSE '555' + RIGHT('0000000' + CAST(ABS(CAST(CHECKSUM(i.Seed + '_WP') AS BIGINT)) % 10000000 AS varchar(7)), 7)
+            END,
+
+        tgt.Address1 =
+            CASE WHEN i.Address1 IS NULL OR NULLIF(LTRIM(RTRIM(i.Address1)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.Address1))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.Address1
+                 ELSE CAST(100 + (ABS(CAST(CHECKSUM(i.Seed + '_A1N') AS BIGINT)) % 9900) AS varchar(5)) + ' ' +
+                      CASE ABS(CAST(CHECKSUM(i.Seed + '_A1S') AS BIGINT)) % 8
+                          WHEN 0 THEN 'Oak St' WHEN 1 THEN 'Maple Ave' WHEN 2 THEN 'Pine Dr' WHEN 3 THEN 'Cedar Ln'
+                          WHEN 4 THEN 'Elm St' WHEN 5 THEN 'Sunset Blvd' WHEN 6 THEN 'Ridge Rd' WHEN 7 THEN 'Lakeview Dr'
+                      END
+            END,
+
+        tgt.Address2 =
+            CASE WHEN i.Address2 IS NULL OR NULLIF(LTRIM(RTRIM(i.Address2)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.Address2))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.Address2
+                 ELSE CASE WHEN ABS(CAST(CHECKSUM(i.Seed + '_A2F') AS BIGINT)) % 4 = 0 THEN NULL
+                           WHEN ABS(CAST(CHECKSUM(i.Seed + '_A2T') AS BIGINT)) % 2 = 0
+                                THEN 'Apt ' + CAST(1 + (ABS(CAST(CHECKSUM(i.Seed + '_APT') AS BIGINT)) % 300) AS varchar(4))
+                           ELSE 'Suite ' + CAST(1 + (ABS(CAST(CHECKSUM(i.Seed + '_STE') AS BIGINT)) % 500) AS varchar(4))
+                      END
+            END,
+
+        tgt.City =
+            CASE WHEN i.City IS NULL OR NULLIF(LTRIM(RTRIM(i.City)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.City))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.City
+                 ELSE
+                    CASE
+                        WHEN i.StateKey = 'NM' THEN
+                            CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY_NM') AS BIGINT)) % 8
+                                WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                                WHEN 4 THEN 'Roswell' WHEN 5 THEN 'Farmington' WHEN 6 THEN 'Clovis' WHEN 7 THEN 'Gallup'
+                            END
+                        WHEN i.StateKey = 'TX' THEN
+                            CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY_TX') AS BIGINT)) % 8
+                                WHEN 0 THEN 'Houston' WHEN 1 THEN 'Dallas' WHEN 2 THEN 'Austin' WHEN 3 THEN 'San Antonio'
+                                WHEN 4 THEN 'Fort Worth' WHEN 5 THEN 'El Paso' WHEN 6 THEN 'Arlington' WHEN 7 THEN 'Plano'
+                            END
+                        ELSE
+                            CASE ABS(CAST(CHECKSUM(i.Seed + '_CITY') AS BIGINT)) % 8
+                                WHEN 0 THEN 'Albuquerque' WHEN 1 THEN 'Santa Fe' WHEN 2 THEN 'Las Cruces' WHEN 3 THEN 'Rio Rancho'
+                                WHEN 4 THEN 'Houston' WHEN 5 THEN 'Dallas' WHEN 6 THEN 'Austin' WHEN 7 THEN 'San Antonio'
+                            END
+                    END
+            END,
+
+        tgt.State =
+            CASE WHEN i.State IS NULL OR NULLIF(LTRIM(RTRIM(i.State)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.State))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.State
+                 ELSE i.StateKey
+            END,
+
+        tgt.PostalCode =
+            CASE WHEN i.PostalCode IS NULL OR NULLIF(LTRIM(RTRIM(i.PostalCode)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.PostalCode))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.PostalCode
+                 ELSE RIGHT('00000' + CAST(70000 + (ABS(CAST(CHECKSUM(i.Seed + '_ZIP') AS BIGINT)) % 9999) AS varchar(5)), 5)
+            END,
+
+        tgt.eMailAddress =
+            CASE WHEN i.eMailAddress IS NULL OR NULLIF(LTRIM(RTRIM(i.eMailAddress)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.eMailAddress))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.eMailAddress
+                 ELSE 'user' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_EM') AS BIGINT))), 12) + '@example.com'
+            END,
+
+        tgt.Gender =
+            CASE WHEN i.Gender IS NULL OR NULLIF(LTRIM(RTRIM(i.Gender)), '') IS NULL
+                      OR UPPER(LTRIM(RTRIM(i.Gender))) IN ('NONE','NULL','N/A','NA')
+                 THEN i.Gender
+                 ELSE CASE ABS(CAST(CHECKSUM(i.Seed + '_G') AS BIGINT)) % 4
+                        WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' WHEN 3 THEN 'Unknown'
+                      END
+            END,
+
+        tgt.Birthdate = CASE WHEN i.Birthdate IS NULL THEN NULL ELSE bd.MaskedBirthdate END,
+        tgt.Age       = CASE WHEN i.Birthdate IS NULL THEN NULL ELSE bd.MaskedAge END,
+
+        tgt.Answer1  = CASE WHEN i.Answer1  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer1)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer1)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer1  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A1')  AS BIGINT))), 12) END,
+        tgt.Answer2  = CASE WHEN i.Answer2  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer2)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer2)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer2  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A2')  AS BIGINT))), 12) END,
+        tgt.Answer3  = CASE WHEN i.Answer3  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer3)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer3)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer3  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A3')  AS BIGINT))), 12) END,
+        tgt.Answer4  = CASE WHEN i.Answer4  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer4)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer4)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer4  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A4')  AS BIGINT))), 12) END,
+        tgt.Answer5  = CASE WHEN i.Answer5  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer5)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer5)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer5  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A5')  AS BIGINT))), 12) END,
+        tgt.Answer6  = CASE WHEN i.Answer6  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer6)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer6)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer6  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A6')  AS BIGINT))), 12) END,
+        tgt.Answer7  = CASE WHEN i.Answer7  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer7)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer7)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer7  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A7')  AS BIGINT))), 12) END,
+        tgt.Answer8  = CASE WHEN i.Answer8  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer8)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer8)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer8  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A8')  AS BIGINT))), 12) END,
+        tgt.Answer9  = CASE WHEN i.Answer9  IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer9)), '')  IS NULL OR UPPER(LTRIM(RTRIM(i.Answer9)))  IN ('NONE','NULL','N/A','NA') THEN i.Answer9  ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A9')  AS BIGINT))), 12) END,
+        tgt.Answer10 = CASE WHEN i.Answer10 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer10)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer10))) IN ('NONE','NULL','N/A','NA') THEN i.Answer10 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A10') AS BIGINT))), 12) END,
+        tgt.Answer11 = CASE WHEN i.Answer11 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer11)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer11))) IN ('NONE','NULL','N/A','NA') THEN i.Answer11 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A11') AS BIGINT))), 12) END,
+        tgt.Answer12 = CASE WHEN i.Answer12 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer12)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer12))) IN ('NONE','NULL','N/A','NA') THEN i.Answer12 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A12') AS BIGINT))), 12) END,
+        tgt.Answer13 = CASE WHEN i.Answer13 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer13)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer13))) IN ('NONE','NULL','N/A','NA') THEN i.Answer13 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A13') AS BIGINT))), 12) END,
+        tgt.Answer14 = CASE WHEN i.Answer14 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer14)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer14))) IN ('NONE','NULL','N/A','NA') THEN i.Answer14 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A14') AS BIGINT))), 12) END,
+        tgt.Answer15 = CASE WHEN i.Answer15 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer15)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer15))) IN ('NONE','NULL','N/A','NA') THEN i.Answer15 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A15') AS BIGINT))), 12) END,
+        tgt.Answer16 = CASE WHEN i.Answer16 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer16)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer16))) IN ('NONE','NULL','N/A','NA') THEN i.Answer16 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A16') AS BIGINT))), 12) END,
+        tgt.Answer17 = CASE WHEN i.Answer17 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer17)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer17))) IN ('NONE','NULL','N/A','NA') THEN i.Answer17 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A17') AS BIGINT))), 12) END,
+        tgt.Answer18 = CASE WHEN i.Answer18 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer18)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer18))) IN ('NONE','NULL','N/A','NA') THEN i.Answer18 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A18') AS BIGINT))), 12) END,
+        tgt.Answer19 = CASE WHEN i.Answer19 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer19)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer19))) IN ('NONE','NULL','N/A','NA') THEN i.Answer19 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A19') AS BIGINT))), 12) END,
+        tgt.Answer20 = CASE WHEN i.Answer20 IS NULL OR NULLIF(LTRIM(RTRIM(i.Answer20)), '') IS NULL OR UPPER(LTRIM(RTRIM(i.Answer20))) IN ('NONE','NULL','N/A','NA') THEN i.Answer20 ELSE 'Masked-' + RIGHT(CONVERT(varchar(40), ABS(CAST(CHECKSUM(i.Seed + '_A20') AS BIGINT))), 12) END
+    FROM [B_carenet].[CARENET_rosters] tgt
+    JOIN st i
+      ON tgt.RowID = i.RowID
+    CROSS APPLY (
+        SELECT
+            MaskedBirthdate = DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+            MaskedAge =
+                DATEDIFF(YEAR,
+                    DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+                    CAST(GETDATE() AS date)
+                )
+                - CASE WHEN DATEADD(YEAR,
+                        DATEDIFF(YEAR,
+                            DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01')),
+                            CAST(GETDATE() AS date)
+                        ),
+                        DATEADD(DAY, ABS(CAST(CHECKSUM(i.Seed + '_DOB') AS BIGINT)) % 25550, CONVERT(date,'1940-01-01'))
+                    ) > CAST(GETDATE() AS date)
+                    THEN 1 ELSE 0 END
+    ) bd;
+END;
+GO
+
