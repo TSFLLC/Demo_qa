@@ -1,0 +1,159 @@
+ADD (SELECT ON OBJECT::B_epic.Patient BY [public])
+
+
++++++++++++++++++STEP 2 — Watermark table (run once)+++++++++++++++++++++++++++
+
+USE TERA;
+GO
+
+IF OBJECT_ID('dbo.Audit_AlertWatermark','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_AlertWatermark
+  (
+    alert_name SYSNAME NOT NULL PRIMARY KEY,
+    last_event_time DATETIME2(7) NOT NULL
+  );
+
+  INSERT INTO dbo.Audit_AlertWatermark(alert_name, last_event_time)
+  VALUES (N'PHI_Select_Denied', '1900-01-01T00:00:00');
+END
+GO
+
+++++++++++++++STEP 3 — Stored procedure that sends the alert email+++++++++++++++++++++++++++++++++++++++
+
+USE TERA;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Alert_PHI_Select_Denied
+  @ProfileName SYSNAME,
+  @Recipients  NVARCHAR(MAX),
+  @SafetyOverlapSeconds INT = 30
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @last DATETIME2(7);
+  SELECT @last = last_event_time
+  FROM dbo.Audit_AlertWatermark
+  WHERE alert_name = N'PHI_Select_Denied';
+
+  DECLARE @since DATETIME2(7) =
+      DATEADD(SECOND, -@SafetyOverlapSeconds, @last);
+
+  ;WITH denied AS
+  (
+    SELECT
+      af.event_time,
+      af.server_principal_name AS login_name,
+      af.database_name,
+      af.schema_name,
+      af.object_name,
+      af.application_name,
+      af.client_ip,
+      af.statement
+    FROM sys.fn_get_audit_file(
+         'E:\SQLAudit\TERA\*.sqlaudit',  -- MUST match your server audit path
+         DEFAULT, DEFAULT
+    ) af
+    WHERE af.action_id = 'SL'        -- SELECT
+      AND af.succeeded = 0           -- DENIED
+      AND af.database_name = 'TERA'
+      AND af.event_time > @since
+      AND af.server_principal_name IS NOT NULL
+      AND LTRIM(RTRIM(af.server_principal_name)) <> ''
+      AND af.server_principal_name NOT LIKE 'svc%'
+      AND af.server_principal_name NOT LIKE 'NT SERVICE\%'
+  )
+  SELECT *
+  INTO #hits
+  FROM denied;
+
+  IF NOT EXISTS (SELECT 1 FROM #hits)
+      RETURN;
+
+  DECLARE @html NVARCHAR(MAX) =
+  N'<h2>🚨 PHI SELECT – DENIED ATTEMPT</h2>
+    <p>The following users attempted to access PHI data but were denied.</p>
+    <table border="1" cellpadding="6" cellspacing="0">
+    <tr>
+      <th>Time (UTC)</th>
+      <th>Login</th>
+      <th>Object</th>
+      <th>Application</th>
+      <th>Client IP</th>
+      <th>Statement</th>
+    </tr>';
+
+  SET @html += (
+    SELECT
+      N'<tr>'
+      + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+      + N'<td>' + login_name + N'</td>'
+      + N'<td>' + schema_name + N'.' + object_name + N'</td>'
+      + N'<td>' + ISNULL(application_name,'') + N'</td>'
+      + N'<td>' + ISNULL(client_ip,'') + N'</td>'
+      + N'<td>' + LEFT(REPLACE(REPLACE(statement,CHAR(13),' '),CHAR(10),' '),500) + N'</td>'
+      + N'</tr>'
+    FROM #hits
+    FOR XML PATH(''), TYPE
+  ).value('.','nvarchar(max)');
+
+  SET @html += N'</table>';
+
+  EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = @ProfileName,
+    @recipients   = @Recipients,
+    @subject      = N'ALERT: PHI SELECT DENIED ATTEMPT',
+    @body         = @html,
+    @body_format  = 'HTML';
+
+  UPDATE dbo.Audit_AlertWatermark
+  SET last_event_time = (SELECT MAX(event_time) FROM #hits)
+  WHERE alert_name = N'PHI_Select_Denied';
+END
+GO
+
+
+++++++++++++++++++++🔹 STEP 4 — SQL Agent job (near-real-time)++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+USE msdb;
+GO
+
+EXEC msdb.dbo.sp_add_job
+  @job_name = N'ALERT_TERA_PHI_Select_Denied',
+  @enabled = 1,
+  @description = N'Immediate alert for denied PHI SELECT attempts';
+GO
+
+EXEC msdb.dbo.sp_add_jobstep
+  @job_name = N'ALERT_TERA_PHI_Select_Denied',
+  @step_name = N'Send Alert',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'
+EXEC dbo.usp_Alert_PHI_Select_Denied
+  @ProfileName = N''DBA-Mail'',
+  @Recipients  = N''security@company.com;dba@company.com'';
+';
+GO
+
+EXEC msdb.dbo.sp_add_schedule
+  @schedule_name = N'Every_10_Seconds_PHI_Denied',
+  @freq_type = 4,
+  @freq_interval = 1,
+  @freq_subday_type = 2,
+  @freq_subday_interval = 10,
+  @active_start_time = 000000;
+GO
+
+EXEC msdb.dbo.sp_attach_schedule
+  @job_name = N'ALERT_TERA_PHI_Select_Denied',
+  @schedule_name = N'Every_10_Seconds_PHI_Denied';
+GO
+
+EXEC msdb.dbo.sp_add_jobserver
+  @job_name = N'ALERT_TERA_PHI_Select_Denied';
+GO
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+SELECT * FROM B_epic.Patient;
+
+
