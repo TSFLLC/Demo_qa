@@ -1,0 +1,41 @@
+USE [TERA];
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_DB_Changes]
+ADD (SELECT ON OBJECT::B_epic.Patient BY [public]);
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_DB_Changes] WITH (STATE = ON);
+GO
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+DECLARE @AuditPath NVARCHAR(4000) = N'E:\SQLAudit\TERA\*.sqlaudit';  -- adjust
+
+SELECT TOP (500)
+    event_time,
+    succeeded,
+    server_principal_name,
+    database_name,
+    schema_name,
+    object_name,
+    statement,
+    application_name,
+    client_ip
+FROM sys.fn_get_audit_file(@AuditPath, DEFAULT, DEFAULT)
+WHERE action_id = 'SL'                -- SELECT
+  AND database_name = 'TERA'
+  AND object_name IN ( 'Patient', 'CDP_PAT_DEMOGRAPHICS', 'CDP_ENCOUNTERS', 'CDP_APPOINTMENTS' ) -- add your PHI objects
+ORDER BY event_time DESC;
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+USE [TERA];
+GO
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_DB_Changes]
+ADD (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP);  -- already in your screenshot
+GO
+
+
