@@ -32,10 +32,6 @@ ORDER BY event_time DESC;
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-USE [TERA];
-GO
-ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_DB_Changes]
-ADD (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP);  -- already in your screenshot
-GO
+
 
 
