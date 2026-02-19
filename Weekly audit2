@@ -1,0 +1,345 @@
+STEP 0 — Fill in your audit name + path (edit once)
+
+USE [TERA];
+GO
+
+DECLARE @ServerAuditName SYSNAME = N'AUD_Prod_TERAtoFile';   -- <-- change if different
+DECLARE @AuditFilePath   NVARCHAR(4000) = N'R:\SQLAudit\TERA\*.sqlaudit'; -- <-- change to your real path
+
+
+++++++++++++++++++++++++++++++////++To find the correct path quickly:++++++++++++++++++++++++++++++++++++++++++
+
+SELECT name, log_file_path
+FROM sys.server_file_audits
+WHERE name = N'AUD_Prod_TERAtoFile';
+
+++++++++++++++++++++++++////++STEP 1 — Create core config tables (Exclude logins + Sensitive keywords)++++++++++++
+
+USE [TERA];
+GO
+
+/* 1A) Exclude principals (service accounts, noise, etc.) */
+IF OBJECT_ID('dbo.Audit_ExcludeLogins','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ExcludeLogins
+  (
+    login_name SYSNAME NOT NULL PRIMARY KEY,
+    reason     NVARCHAR(200) NULL,
+    created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+/* Seed common excludes (edit as needed) */
+IF NOT EXISTS (SELECT 1 FROM dbo.Audit_ExcludeLogins WHERE login_name = N'sa')
+INSERT dbo.Audit_ExcludeLogins(login_name, reason) VALUES (N'sa', N'Built-in login (if used, review separately)');
+
+GO
+
+/* 1B) Sensitive keywords */
+IF OBJECT_ID('dbo.Audit_SensitiveKeywords','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_SensitiveKeywords
+  (
+    keyword SYSNAME NOT NULL PRIMARY KEY,
+    category NVARCHAR(50) NULL,   -- PII/PHI/HR
+    risk_level VARCHAR(10) NULL,  -- High/Med/Low
+    created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+/* Seed keywords (customize for HR & PHI) */
+MERGE dbo.Audit_SensitiveKeywords AS t
+USING (VALUES
+ (N'SSN',          N'PII', N'High'),
+ (N'DEA',          N'PII', N'High'),
+ (N'DEANumber',    N'PII', N'High'),
+ (N'DOB',          N'PII', N'Med'),
+ (N'DateOfBirth',  N'PII', N'Med'),
+ (N'Email',        N'PII', N'Med'),
+ (N'EmailAddress', N'PII', N'Med'),
+ (N'Phone',        N'PII', N'Med'),
+ (N'PhoneNumber',  N'PII', N'Med'),
+ (N'Mobile',       N'PII', N'Med'),
+ (N'FirstName',    N'PII', N'Low'),
+ (N'LastName',     N'PII', N'Low'),
+ (N'FullName',     N'PII', N'Low'),
+ (N'Salary',       N'HR',  N'High'),
+ (N'Compensation', N'HR',  N'High'),
+ (N'BankAccount',  N'HR',  N'High')
+) AS s(keyword, category, risk_level)
+ON t.keyword = s.keyword
+WHEN NOT MATCHED THEN
+  INSERT(keyword, category, risk_level) VALUES(s.keyword, s.category, s.risk_level);
+GO
+
+
+++++++++++++STEP 2 — Create AD group mapping + cache table++++++++++++++++++++++
+
+USE [TERA];
+GO
+
+/* 2A) AD group -> category mapping */
+IF OBJECT_ID('dbo.Audit_ADGroupCategory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ADGroupCategory
+  (
+    ad_group SYSNAME NOT NULL PRIMARY KEY,
+    category VARCHAR(20) NOT NULL CHECK (category IN ('Tech','Business')),
+    notes NVARCHAR(200) NULL,
+    created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+/* 2B) Cache table for login -> category */
+IF OBJECT_ID('dbo.Audit_UserCategoryCache','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_UserCategoryCache
+  (
+    login_name SYSNAME NOT NULL PRIMARY KEY,
+    category   VARCHAR(20) NOT NULL,
+    matched_group SYSNAME NULL,
+    refreshed_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+  CREATE INDEX IX_Audit_UserCategoryCache_Category ON dbo.Audit_UserCategoryCache(category);
+END
+GO
+
++++++++++++++++/////STEP 2 — Create AD group mapping + cache table///++++++++
+
+USE [TERA];
+GO
+
+/* 2A) AD group -> category mapping */
+IF OBJECT_ID('dbo.Audit_ADGroupCategory','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ADGroupCategory
+  (
+    ad_group SYSNAME NOT NULL PRIMARY KEY,
+    category VARCHAR(20) NOT NULL CHECK (category IN ('Tech','Business')),
+    notes NVARCHAR(200) NULL,
+    created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+/* 2B) Cache table for login -> category */
+IF OBJECT_ID('dbo.Audit_UserCategoryCache','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_UserCategoryCache
+  (
+    login_name SYSNAME NOT NULL PRIMARY KEY,
+    category   VARCHAR(20) NOT NULL,
+    matched_group SYSNAME NULL,
+    refreshed_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+  CREATE INDEX IX_Audit_UserCategoryCache_Category ON dbo.Audit_UserCategoryCache(category);
+END
+GO
+
+
+++++++++++++///Seed your groups
+
+Insert the AD groups you showed earlier (your screenshot). Example template:++++++++++++++++++++++++++++++++
+
+MERGE dbo.Audit_ADGroupCategory AS t
+USING (VALUES
+ (N'ARDENT\HR_DATA_READERS',  'Business', N'HR team read access'),
+ (N'ARDENT\DBA_TEAM',         'Tech',     N'DBA group'),
+ (N'ARDENT\DATA_ENGINEERING', 'Tech',     N'Data Engineering group')
+) AS s(ad_group, category, notes)
+ON t.ad_group = s.ad_group
+WHEN MATCHED THEN UPDATE SET category=s.category, notes=s.notes
+WHEN NOT MATCHED THEN INSERT(ad_group, category, notes) VALUES(s.ad_group, s.category, s.notes);
+GO
+
++++++++++++++++++++++STEP 3 — Create refresh procedure (xp_logininfo-based)++++++++++++++++++++++++++++
+USE [TERA];
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Refresh_AuditUserCategoryCache
+  @LookbackHours INT = 168
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @since DATETIME2(7) = DATEADD(HOUR, -@LookbackHours, SYSUTCDATETIME());
+
+  /* Pull distinct logins from audit data (base view) */
+  IF OBJECT_ID('tempdb..#Logins') IS NOT NULL DROP TABLE #Logins;
+
+  SELECT DISTINCT server_principal_name AS login_name
+  INTO #Logins
+  FROM dbo.v_Audit_All
+  WHERE event_time >= @since
+    AND server_principal_name IS NOT NULL
+    AND server_principal_name <> N''
+    AND server_principal_name NOT LIKE 'svc%'
+    AND server_principal_name NOT LIKE 'NT SERVICE\%'
+    AND server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins);
+
+  /* For each login, find first matching AD group from mapping */
+  DECLARE @login SYSNAME;
+
+  DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+    SELECT login_name FROM #Logins;
+
+  OPEN c;
+  FETCH NEXT FROM c INTO @login;
+
+  WHILE @@FETCH_STATUS = 0
+  BEGIN
+    DECLARE @matchedGroup SYSNAME = NULL;
+    DECLARE @category VARCHAR(20) = 'Unknown';
+
+    -- xp_logininfo returns groups a user belongs to (domain required)
+    IF OBJECT_ID('tempdb..#groups') IS NOT NULL DROP TABLE #groups;
+    CREATE TABLE #groups
+    (
+      accountname SYSNAME NULL,
+      type SYSNAME NULL,
+      privilege SYSNAME NULL,
+      mappedloginname SYSNAME NULL,
+      permissionpath SYSNAME NULL
+    );
+
+    BEGIN TRY
+      INSERT #groups
+      EXEC master..xp_logininfo @acctname = @login, @option = 'all';
+    END TRY
+    BEGIN CATCH
+      -- If xp_logininfo fails, keep Unknown
+    END CATCH
+
+    SELECT TOP (1)
+      @matchedGroup = m.ad_group,
+      @category = m.category
+    FROM dbo.Audit_ADGroupCategory m
+    JOIN #groups g
+      ON g.permissionpath = m.ad_group
+      OR g.accountname = m.ad_group;
+
+    MERGE dbo.Audit_UserCategoryCache AS t
+    USING (SELECT @login AS login_name) AS s
+      ON t.login_name = s.login_name
+    WHEN MATCHED THEN
+      UPDATE SET category = @category,
+                 matched_group = @matchedGroup,
+                 refreshed_at_utc = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT(login_name, category, matched_group, refreshed_at_utc)
+      VALUES(@login, @category, @matchedGroup, SYSUTCDATETIME());
+
+    FETCH NEXT FROM c INTO @login;
+  END
+
+  CLOSE c;
+  DEALLOCATE c;
+END
+GO
+++++++++++++++++++++++++++///STEP 4 — Build Audit Base View (dbo.v_Audit_All)//////////////////////////
+
+USE [TERA];
+GO
+
+CREATE OR ALTER VIEW dbo.v_Audit_All
+AS
+SELECT
+  event_time,
+  action_id,
+  succeeded,
+  server_principal_name,
+  database_name,
+  schema_name,
+  object_name,
+  statement,
+  client_ip,
+  application_name
+FROM sys.fn_get_audit_file(N'R:\SQLAudit\TERA\*.sqlaudit', DEFAULT, DEFAULT);
+GO
+----✅ Replace the hardcoded path with your actual audit path.
+
++++++++++++++//STEP 5 — Create the 3 report views you need
+5A) PHI/HR SELECT view++++++++++++++++++++++++++++++++++++++
+
+CREATE OR ALTER VIEW dbo.v_Audit_PHI_Selects
+AS
+SELECT *
+FROM dbo.v_Audit_All
+WHERE action_id = 'SL'  -- SELECT
+  AND database_name = 'TERA';
+GO
+++++++++++++++++++5B) Failed logins (human-only)+++++++++++++++++++++
+
+CREATE OR ALTER VIEW dbo.v_Audit_FailedLogins_Human
+AS
+SELECT
+  event_time,
+  server_principal_name AS login_name,
+  client_ip,
+  application_name,
+  statement AS error_message,
+  action_id,
+  succeeded
+FROM dbo.v_Audit_All
+WHERE action_id IN ('LGIF')   -- login failed
+  AND (server_principal_name IS NOT NULL AND server_principal_name <> '')
+  AND server_principal_name NOT LIKE 'svc%'
+  AND server_principal_name NOT LIKE 'NT SERVICE\%';
+GO
+
+++++++++5C) Table/Schema drops++++++++++++++++
+CREATE OR ALTER VIEW dbo.v_Audit_TableDrops
+AS
+SELECT
+  event_time,
+  server_principal_name AS login_name,
+  client_ip,
+  application_name,
+  database_name,
+  schema_name,
+  object_name,
+  statement,
+  action_id,
+  succeeded
+FROM dbo.v_Audit_All
+WHERE action_id IN ('DR','DL')  -- DROP events (varies by audit config)
+  AND database_name = 'TERA';
+GO
++++++++++++++++
+
+++++++++++++++
+
++++++++++++++++++
+
+What you do next
+
+Update the audit file path in dbo.v_Audit_All
+
+Populate dbo.Audit_ADGroupCategory with your real AD group names
+
+Test cache refresh:
+
+EXEC dbo.usp_Refresh_AuditUserCategoryCache @LookbackHours = 24;
+SELECT TOP 50 * FROM dbo.Audit_UserCategoryCache ORDER BY refreshed_at_utc DESC;
+
+
+Then we can plug back in the weekly pack procedures (already written earlier)
+
+Important: action_id codes may vary
+
+If your “Drop” or “Login failed” events are not showing, that means the audit action groups enabled in the audit spec differ.
+We can quickly confirm by running:
+
+SELECT TOP 50 action_id, COUNT(*) cnt
+FROM dbo.v_Audit_All
+WHERE event_time > DATEADD(DAY,-7,SYSUTCDATETIME())
+GROUP BY action_id
+ORDER BY cnt DESC;
+
+
+Then we map the correct action_id values.
+
+
