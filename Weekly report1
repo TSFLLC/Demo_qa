@@ -1,0 +1,534 @@
+
+2) Disposition Log Table Script (governance record)
+
+USE [TERA];
+GO
+
+IF OBJECT_ID('dbo.Audit_DispositionLog','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_DispositionLog
+  (
+    disposition_id      BIGINT IDENTITY(1,1) PRIMARY KEY,
+    review_week_start   DATE        NOT NULL,  -- Monday (or your chosen week start)
+    review_week_end     DATE        NOT NULL,
+    event_time_utc      DATETIME2(7) NOT NULL,
+    event_type          VARCHAR(50)  NOT NULL,  -- e.g. PHI_WHERE_SENSITIVE, FAILED_LOGIN, TABLE_DROP
+    severity            VARCHAR(10)  NULL,      -- HIGH/MEDIUM/LOW (null for login/drop if you want)
+    user_category       VARCHAR(20)  NULL,      -- Tech/Business/Unknown
+    login_name          SYSNAME      NULL,
+    application_name    NVARCHAR(256) NULL,
+    client_ip           NVARCHAR(64) NULL,
+    database_name       SYSNAME      NULL,
+    schema_name         SYSNAME      NULL,
+    object_name         SYSNAME      NULL,
+    matched_keyword     SYSNAME      NULL,
+    where_snippet       NVARCHAR(1000) NULL,
+    statement_hash      VARBINARY(32) NULL,     -- optional: store HASHBYTES('SHA2_256', statement)
+    disposition         VARCHAR(30) NOT NULL,   -- Approved, FollowUp, Incident, FalsePositive
+    justification       NVARCHAR(1000) NULL,
+    ticket_ref          NVARCHAR(100) NULL,
+    owner               NVARCHAR(200) NULL,
+    due_date            DATE NULL,
+    reviewed_by         NVARCHAR(200) NOT NULL,
+    reviewed_at_utc     DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME(),
+    notes               NVARCHAR(2000) NULL
+  );
+
+  CREATE INDEX IX_Audit_DispositionLog_Week
+    ON dbo.Audit_DispositionLog(review_week_start, severity, user_category);
+
+  CREATE INDEX IX_Audit_DispositionLog_EventTime
+    ON dbo.Audit_DispositionLog(event_time_utc);
+END
+GO
+
+
+
+3) Weekly Summary Stored Procedure (exec metrics + trends)
+USE [TERA];
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Weekly_Audit_Summary
+    @WeekStart DATE = NULL,     -- if NULL, auto: Monday of current week (UTC)
+    @WeekEnd   DATE = NULL      -- if NULL, WeekStart + 7
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @utcToday DATE = CONVERT(DATE, SYSUTCDATETIME());
+
+    -- Default WeekStart = Monday (UTC)
+    IF @WeekStart IS NULL
+    BEGIN
+        DECLARE @dow INT = (DATEPART(WEEKDAY, @utcToday) + @@DATEFIRST - 2) % 7;  -- 0=Mon
+        SET @WeekStart = DATEADD(DAY, -@dow, @utcToday);
+    END
+
+    IF @WeekEnd IS NULL
+        SET @WeekEnd = DATEADD(DAY, 7, @WeekStart);
+
+    DECLARE @StartDT DATETIME2(7) = CAST(@WeekStart AS DATETIME2(7));
+    DECLARE @EndDT   DATETIME2(7) = CAST(@WeekEnd   AS DATETIME2(7));
+
+    /* 0) Refresh AD cache to keep Tech/Business accurate */
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache @LookbackHours = 168;
+
+    /* 1) Executive metrics */
+    ;WITH phi AS
+    (
+      SELECT
+        a.event_time,
+        a.server_principal_name AS login_name,
+        COALESCE(c.category,'Unknown') AS user_category,
+        a.application_name,
+        a.client_ip,
+        a.schema_name,
+        a.object_name,
+        LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+      WHERE a.event_time >= @StartDT AND a.event_time < @EndDT
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+    ),
+    hits AS
+    (
+      SELECT
+        p.*,
+        CASE WHEN p.stmt_l LIKE '% where %' THEN 1 ELSE 0 END AS has_where,
+        sk.keyword AS matched_keyword,
+        CASE
+          WHEN p.user_category IN ('Business','Unknown') AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+          WHEN sk.keyword IN ('SSN','DEA','DEANumber')
+               AND (p.stmt_l LIKE '% like %' OR p.stmt_l LIKE '% in (%' OR p.stmt_l LIKE '% between %' OR p.stmt_l LIKE '%>=%' OR p.stmt_l LIKE '%<=%')
+               THEN 'HIGH'
+          WHEN p.user_category IN ('Business','Unknown')
+               AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                  'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+               THEN 'MEDIUM'
+          WHEN p.user_category = 'Tech' AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+          WHEN p.user_category = 'Tech'
+               AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                  'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+               THEN 'LOW'
+          ELSE 'MEDIUM'
+        END AS severity
+      FROM phi p
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE p.stmt_l LIKE '% where %'
+          AND p.stmt_l LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE p.stmt_l LIKE '% where %' AND sk.keyword IS NOT NULL
+    )
+    SELECT
+      'ExecutiveSummary' AS Section,
+      COUNT(*) AS Total_PHI_WhereSensitive,
+      SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) AS High_Count,
+      SUM(CASE WHEN user_category='Business' THEN 1 ELSE 0 END) AS Business_Count,
+      SUM(CASE WHEN user_category='Tech' THEN 1 ELSE 0 END) AS Tech_Count,
+      SUM(CASE WHEN user_category='Unknown' THEN 1 ELSE 0 END) AS Unknown_Count
+    FROM hits;
+
+    /* 2) Top offenders (users) */
+    ;WITH hits AS
+    (
+      SELECT
+        a.event_time,
+        a.server_principal_name AS login_name,
+        COALESCE(c.category,'Unknown') AS user_category,
+        LOWER(a.statement) AS stmt_l,
+        sk.keyword AS matched_keyword,
+        CASE
+          WHEN COALESCE(c.category,'Unknown') IN ('Business','Unknown') AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+          WHEN COALESCE(c.category,'Unknown') = 'Tech' AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+          ELSE 'MEDIUM'
+        END AS severity
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE LOWER(a.statement) LIKE '% where %'
+          AND LOWER(a.statement) LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE a.event_time >= @StartDT AND a.event_time < @EndDT
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+        AND LOWER(a.statement) LIKE '% where %'
+        AND sk.keyword IS NOT NULL
+    )
+    SELECT TOP (20)
+      'TopUsers' AS Section,
+      user_category,
+      login_name,
+      COUNT(*) AS Events,
+      SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) AS HighEvents
+    FROM hits
+    GROUP BY user_category, login_name
+    ORDER BY HighEvents DESC, Events DESC;
+
+    /* 3) Failed logins (human-only) */
+    SELECT
+      'FailedLogins' AS Section,
+      *
+    FROM dbo.v_Audit_FailedLogins_Human
+    WHERE event_time >= @StartDT AND event_time < @EndDT
+    ORDER BY event_time DESC;
+
+    /* 4) Table drops */
+    SELECT
+      'TableDrops' AS Section,
+      *
+    FROM dbo.v_Audit_TableDrops
+    WHERE event_time >= @StartDT AND event_time < @EndDT
+    ORDER BY event_time DESC;
+END
+GO
+
+
++++++++++++++++++++//4) Weekly Audit Pack Email Procedure (one email, multiple sections)+++++++++++++++++++++++
+
+USE [TERA];
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Email_Weekly_Audit_Pack
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @WeekStart   DATE = NULL,
+    @WeekEnd     DATE = NULL,
+    @MaxRowsPerSection INT = 200
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @utcToday DATE = CONVERT(DATE, SYSUTCDATETIME());
+
+    IF @WeekStart IS NULL
+    BEGIN
+        DECLARE @dow INT = (DATEPART(WEEKDAY, @utcToday) + @@DATEFIRST - 2) % 7;  -- 0=Mon
+        SET @WeekStart = DATEADD(DAY, -@dow, @utcToday);
+    END
+    IF @WeekEnd IS NULL
+        SET @WeekEnd = DATEADD(DAY, 7, @WeekStart);
+
+    DECLARE @StartDT DATETIME2(7) = CAST(@WeekStart AS DATETIME2(7));
+    DECLARE @EndDT   DATETIME2(7) = CAST(@WeekEnd   AS DATETIME2(7));
+
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache @LookbackHours = 168;
+
+    DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%; table-layout:fixed;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word; white-space:normal;}
+  th{background:#f3f3f3;}
+  .sev{width:80px;}
+  .time{width:150px;}
+  .cat{width:90px;}
+  .login{width:190px;}
+  .grp{width:240px;}
+  .obj{width:240px;}
+  .ip{width:120px;}
+  .app{width:220px;}
+  .key{width:120px;}
+</style>';
+
+    DECLARE @html NVARCHAR(MAX) = @style
+      + N'<h2>Weekly Audit Pack - TERA</h2>'
+      + N'<p><b>Window (UTC):</b> ' + CONVERT(NVARCHAR(10), @WeekStart, 120)
+      + N' to ' + CONVERT(NVARCHAR(10), @WeekEnd, 120) + N'</p>';
+
+    /* =========================
+       Executive Summary
+       ========================= */
+    DECLARE @Total INT=0, @High INT=0, @Biz INT=0, @Tech INT=0, @Unk INT=0;
+
+    ;WITH phi AS
+    (
+      SELECT
+        a.event_time,
+        a.server_principal_name AS login_name,
+        COALESCE(c.category,'Unknown') AS user_category,
+        LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+      WHERE a.event_time >= @StartDT AND a.event_time < @EndDT
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+    ),
+    hits AS
+    (
+      SELECT
+        p.user_category,
+        sk.keyword AS matched_keyword,
+        CASE
+          WHEN p.user_category IN ('Business','Unknown') AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+          WHEN p.user_category = 'Tech' AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+          ELSE 'MEDIUM'
+        END AS severity
+      FROM phi p
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE p.stmt_l LIKE '% where %'
+          AND p.stmt_l LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE p.stmt_l LIKE '% where %' AND sk.keyword IS NOT NULL
+    )
+    SELECT
+      @Total = COUNT(*),
+      @High  = SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END),
+      @Biz   = SUM(CASE WHEN user_category='Business' THEN 1 ELSE 0 END),
+      @Tech  = SUM(CASE WHEN user_category='Tech' THEN 1 ELSE 0 END),
+      @Unk   = SUM(CASE WHEN user_category='Unknown' THEN 1 ELSE 0 END)
+    FROM hits;
+
+    SET @html += N'<h3>Executive Summary</h3>'
+      + N'<table><tr><th>Total WHERE-sensitive</th><th>High</th><th>Business</th><th>Tech</th><th>Unknown</th></tr>'
+      + N'<tr><td>' + CAST(@Total AS NVARCHAR(20)) + N'</td>'
+      + N'<td>' + CAST(@High  AS NVARCHAR(20)) + N'</td>'
+      + N'<td>' + CAST(@Biz   AS NVARCHAR(20)) + N'</td>'
+      + N'<td>' + CAST(@Tech  AS NVARCHAR(20)) + N'</td>'
+      + N'<td>' + CAST(@Unk   AS NVARCHAR(20)) + N'</td></tr></table>';
+
+    /* =========================
+       PHI/HR WHERE Sensitive (detailed)
+       ========================= */
+    IF OBJECT_ID('tempdb..#PHI') IS NOT NULL DROP TABLE #PHI;
+
+    ;WITH base AS
+    (
+      SELECT TOP (@MaxRowsPerSection)
+        a.event_time,
+        a.server_principal_name AS login_name,
+        COALESCE(c.category,'Unknown') AS user_category,
+        c.matched_group,
+        a.schema_name,
+        a.object_name,
+        a.client_ip,
+        a.application_name,
+        LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c ON c.login_name = a.server_principal_name
+      WHERE a.event_time >= @StartDT AND a.event_time < @EndDT
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+        AND LOWER(a.statement) LIKE '% where %'
+      ORDER BY a.event_time DESC
+    )
+    SELECT
+      b.*,
+      sk.keyword AS matched_keyword,
+      SUBSTRING(b.stmt_l, CHARINDEX(' where ', b.stmt_l), 4000) AS where_text,
+      CASE
+        WHEN b.user_category IN ('Business','Unknown') AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+        WHEN sk.keyword IN ('SSN','DEA','DEANumber')
+             AND (b.stmt_l LIKE '% like %' OR b.stmt_l LIKE '% in (%' OR b.stmt_l LIKE '% between %' OR b.stmt_l LIKE '%>=%' OR b.stmt_l LIKE '%<=%')
+             THEN 'HIGH'
+        WHEN b.user_category IN ('Business','Unknown')
+             AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+             THEN 'MEDIUM'
+        WHEN b.user_category = 'Tech' AND sk.keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+        WHEN b.user_category = 'Tech'
+             AND sk.keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+             THEN 'LOW'
+        ELSE 'MEDIUM'
+      END AS severity
+    INTO #PHI
+    FROM base b
+    OUTER APPLY
+    (
+      SELECT TOP (1) keyword
+      FROM dbo.Audit_SensitiveKeywords
+      WHERE b.stmt_l LIKE '% where %'
+        AND b.stmt_l LIKE '%' + LOWER(keyword) + '%'
+      ORDER BY keyword
+    ) sk
+    WHERE sk.keyword IS NOT NULL;
+
+    DECLARE @phiHeader NVARCHAR(MAX) =
+      N'<table><tr>'
+      + N'<th class="time">event_time</th>'
+      + N'<th class="sev">severity</th>'
+      + N'<th class="cat">category</th>'
+      + N'<th class="login">login</th>'
+      + N'<th class="grp">matched AD group</th>'
+      + N'<th class="obj">object</th>'
+      + N'<th class="ip">client_ip</th>'
+      + N'<th class="app">application</th>'
+      + N'<th class="key">keyword</th>'
+      + N'<th>WHERE snippet</th>'
+      + N'</tr>';
+
+    DECLARE @BizRows NVARCHAR(MAX)=N'', @TechRows NVARCHAR(MAX)=N'', @UnkRows NVARCHAR(MAX)=N'';
+
+    SELECT @BizRows =
+    (
+      SELECT N'<tr>'
+       + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+       + N'<td>' + severity + N'</td>'
+       + N'<td>' + user_category + N'</td>'
+       + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_group,N'') + N'</td>'
+       + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+       + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_keyword,N'') + N'</td>'
+       + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+       + N'</tr>'
+      FROM #PHI
+      WHERE user_category='Business'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 9 END, event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SELECT @TechRows =
+    (
+      SELECT N'<tr>'
+       + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+       + N'<td>' + severity + N'</td>'
+       + N'<td>' + user_category + N'</td>'
+       + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_group,N'') + N'</td>'
+       + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+       + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_keyword,N'') + N'</td>'
+       + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+       + N'</tr>'
+      FROM #PHI
+      WHERE user_category='Tech'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 9 END, event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SELECT @UnkRows =
+    (
+      SELECT N'<tr>'
+       + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+       + N'<td>' + severity + N'</td>'
+       + N'<td>' + user_category + N'</td>'
+       + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_group,N'') + N'</td>'
+       + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+       + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+       + N'<td>' + ISNULL(matched_keyword,N'') + N'</td>'
+       + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+       + N'</tr>'
+      FROM #PHI
+      WHERE user_category='Unknown'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 9 END, event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SET @html += N'<h3>PHI/HR WHERE-Sensitive Access</h3>';
+
+    SET @html += N'<h4>Business</h4>'
+      + CASE WHEN @BizRows IS NULL OR LEN(@BizRows)=0
+             THEN N'<p><b>No Business events.</b></p>'
+             ELSE @phiHeader + @BizRows + N'</table>' END;
+
+    SET @html += N'<h4>Tech</h4>'
+      + CASE WHEN @TechRows IS NULL OR LEN(@TechRows)=0
+             THEN N'<p><b>No Tech events.</b></p>'
+             ELSE @phiHeader + @TechRows + N'</table>' END;
+
+    SET @html += N'<h4>Unknown</h4>'
+      + CASE WHEN @UnkRows IS NULL OR LEN(@UnkRows)=0
+             THEN N'<p><b>No Unknown events.</b></p>'
+             ELSE @phiHeader + @UnkRows + N'</table>' END;
+
+    /* =========================
+       Failed Logins (human-only)
+       ========================= */
+    DECLARE @LoginHeader NVARCHAR(MAX) =
+      N'<table><tr><th class="time">event_time</th><th class="login">login</th><th class="ip">client_ip</th><th class="app">application</th><th>message</th></tr>';
+
+    DECLARE @LoginRows NVARCHAR(MAX)=N'';
+    SELECT @LoginRows =
+    (
+      SELECT TOP (@MaxRowsPerSection)
+        N'<tr>'
+        + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+        + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(error_message,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td>'
+        + N'</tr>'
+      FROM dbo.v_Audit_FailedLogins_Human
+      WHERE event_time >= @StartDT AND event_time < @EndDT
+      ORDER BY event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SET @html += N'<h3>Failed Logins (Human)</h3>'
+      + CASE WHEN @LoginRows IS NULL OR LEN(@LoginRows)=0
+             THEN N'<p><b>No failed logins.</b></p>'
+             ELSE @LoginHeader + @LoginRows + N'</table>' END;
+
+    /* =========================
+       Table Drops
+       ========================= */
+    DECLARE @DropHeader NVARCHAR(MAX) =
+      N'<table><tr><th class="time">event_time</th><th class="login">login</th><th class="ip">client_ip</th><th class="app">application</th><th class="obj">object</th><th>statement</th></tr>';
+
+    DECLARE @DropRows NVARCHAR(MAX)=N'';
+    SELECT @DropRows =
+    (
+      SELECT TOP (@MaxRowsPerSection)
+        N'<tr>'
+        + N'<td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+        + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td>'
+        + N'</tr>'
+      FROM dbo.v_Audit_TableDrops
+      WHERE event_time >= @StartDT AND event_time < @EndDT
+      ORDER BY event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SET @html += N'<h3>Table/Schema Drops</h3>'
+      + CASE WHEN @DropRows IS NULL OR LEN(@DropRows)=0
+             THEN N'<p><b>No drop events.</b></p>'
+             ELSE @DropHeader + @DropRows + N'</table>' END;
+
+    DECLARE @subject NVARCHAR(200) =
+      N'Weekly Audit Pack - TERA (' + CONVERT(NVARCHAR(10), @WeekStart, 120) + N' to ' + CONVERT(NVARCHAR(10), @WeekEnd, 120) + N')';
+
+    EXEC msdb.dbo.sp_send_dbmail
+      @profile_name = @ProfileName,
+      @recipients   = @Recipients,
+      @subject      = @subject,
+      @body         = @html,
+      @body_format  = 'HTML';
+END
+GO
+
+
+++++++++++++++++++Run weekly+++++++++++++++++++++++++++++++++++++++
+
+EXEC dbo.usp_Email_Weekly_Audit_Pack
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'security@company.com;hr-security@company.com;dba@company.com',
+  @WeekStart   = '2026-02-16',   -- Monday
+  @WeekEnd     = '2026-02-23',   -- next Monday
+  @MaxRowsPerSection = 200;
+
