@@ -1,0 +1,1061 @@
+/* ============================================================
+   ONE-CLICK PROD DEPLOYMENT — TERA Audit Program (SQL 2022)
+   Includes:
+   - Server Audit -> File (.sqlaudit)
+   - DB Audit Spec -> DDL + SELECT on PHI tables
+   - XE session -> Export signals (.xel)
+   - Views: v_Audit_All, v_Audit_PHI_Selects, v_Report_PotentialExport
+   - Tables: ExcludeLogins, SensitiveKeywords, ADGroupCategory,
+             UserCategoryCache, AlertWatermark
+   - Procs: usp_Refresh_AuditUserCategoryCache,
+            usp_Alert_PHI_WhereSensitive_NewOnly,
+            usp_Email_Weekly_Audit_Pack
+   - Jobs: 10-sec alert + weekly pack
+   ============================================================ */
+
+---------------------------------------------------------------
+-- STEP 0 — CONFIG (EDIT THESE)
+---------------------------------------------------------------
+DECLARE @AuditFolder      NVARCHAR(260) = N'R:\SQLAudit\TERA\';
+DECLARE @AuditFileMask    NVARCHAR(300) = N'R:\SQLAudit\TERA\*.sqlaudit';
+DECLARE @XEFile           NVARCHAR(300) = N'R:\SQLAudit\TERA\XE_TERA_ExportSignals.xel';
+
+DECLARE @ServerAuditName  SYSNAME = N'AUD_Prod_TERAToFile';
+DECLARE @DbAuditSpecName  SYSNAME = N'AUDSPEC_TERA_Select_Targeted';
+
+DECLARE @MailProfile      SYSNAME = N'DBA-Mail';
+DECLARE @WeeklyRecipients NVARCHAR(MAX) = N'security@company.com;dba@company.com';
+DECLARE @AlertRecipients  NVARCHAR(MAX) = N'security@company.com;dba@company.com';
+
+DECLARE @MaxRowsWeekly    INT = 200;
+DECLARE @MaxRowsAlert     INT = 200;
+
+---------------------------------------------------------------
+-- STEP 1 — PREREQ CHECKS
+---------------------------------------------------------------
+PRINT 'Checking audit folder visibility...';
+EXEC master.dbo.xp_fileexist 'R:\SQLAudit\TERA\';
+
+PRINT 'Checking DB Mail profiles...';
+EXEC msdb.dbo.sysmail_help_profile_sp;
+
+---------------------------------------------------------------
+-- STEP 2 — SERVER AUDIT (to file)
+---------------------------------------------------------------
+USE master;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.server_audits WHERE name = N'AUD_Prod_TERAToFile')
+BEGIN
+    EXEC (N'
+    CREATE SERVER AUDIT [AUD_Prod_TERAToFile]
+    TO FILE
+    (
+        FILEPATH = N''R:\SQLAudit\TERA\'',
+        MAXSIZE = 1024 MB,
+        MAX_ROLLOVER_FILES = 200,
+        RESERVE_DISK_SPACE = OFF
+    )
+    WITH
+    (
+        QUEUE_DELAY = 1000,
+        ON_FAILURE = CONTINUE
+    );');
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.server_audits WHERE name = N'AUD_Prod_TERAToFile' AND is_state_enabled = 0)
+    ALTER SERVER AUDIT [AUD_Prod_TERAToFile] WITH (STATE = ON);
+GO
+
+---------------------------------------------------------------
+-- STEP 3 — DATABASE AUDIT SPEC (TERA) : DDL + SELECT on PHI tables
+---------------------------------------------------------------
+USE TERA;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.database_audit_specifications WHERE name = N'AUDSPEC_TERA_Select_Targeted')
+BEGIN
+    CREATE DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+    FOR SERVER AUDIT [AUD_Prod_TERAToFile];
+END
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted] WITH (STATE = OFF);
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.database_audit_specification_details d
+    JOIN sys.database_audit_specifications s
+      ON d.database_specification_id = s.database_specification_id
+    WHERE s.name = N'AUDSPEC_TERA_Select_Targeted'
+      AND d.audit_action_name = N'DATABASE_OBJECT_CHANGE_GROUP'
+)
+BEGIN
+    ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+    ADD (DATABASE_OBJECT_CHANGE_GROUP);
+END
+GO
+
+/* ===== EDIT PHI TABLE TARGETS ONLY ===== */
+DECLARE @Targets TABLE (SchemaName SYSNAME, TableName SYSNAME);
+INSERT INTO @Targets (SchemaName, TableName)
+VALUES
+    (N'B_hipaatizer', N'sub_23e30401_a88f_4482_96c3_cdf57dbad4f2'),
+    (N'B_hipaatizer', N'sub_3f1acb99_0a2f_4649_ba5d_540b70186d94'),
+    (N'B_hipaatizer', N'sub_759e68f8_20e0_4c68_a832_10a56dcc0220'),
+    (N'B_hipaatizer', N'sub_76bc1d94_e875_47c6_aada_682f331a48ae'),
+    (N'B_hipaatizer', N'sub_7c5cbbfa_2281_433a_9b30_96aa55340f1b'),
+    (N'B_hipaatizer', N'sub_8bef00e4_7ac4_4459_8940_e688a26a48dc'),
+    (N'B_hipaatizer', N'sub_8ffdd7a5_68db_4d2d_8da0_2b254d8826fb'),
+    (N'B_hipaatizer', N'sub_93fb2298_af42_4847_b4c1_04fb8551dc5d'),
+    (N'B_hipaatizer', N'sub_bbba0231_9080_4e96_812b_8a3dc806a992'),
+    (N'B_hipaatizer', N'sub_f372d42e_c35d_4826_9124_ff67421c48e9'),
+    (N'S_cdpdynamics', N'CDP_APPOINTMENTS'),
+    (N'S_cdpdynamics', N'CDP_ENCOUNTERS'),
+    (N'S_cdpdynamics', N'CDP_PAT_DEMOGRAPHICS');
+/* ====================================== */
+
+DECLARE @sql NVARCHAR(MAX) = N'';
+
+SELECT @sql += N'
+IF OBJECT_ID(N''' + QUOTENAME(t.SchemaName) + N'.' + QUOTENAME(t.TableName) + N''') IS NOT NULL
+AND NOT EXISTS
+(
+  SELECT 1
+  FROM sys.database_audit_specification_details d
+  JOIN sys.database_audit_specifications s
+    ON d.database_specification_id = s.database_specification_id
+  WHERE s.name = N''AUDSPEC_TERA_Select_Targeted''
+    AND d.audit_action_name = N''SL''
+    AND d.major_id = OBJECT_ID(N''' + QUOTENAME(t.SchemaName) + N'.' + QUOTENAME(t.TableName) + N''')
+)
+BEGIN
+  ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+  ADD (SELECT ON OBJECT::' + QUOTENAME(t.SchemaName) + N'.' + QUOTENAME(t.TableName) + N' BY [public]);
+END;'
+FROM @Targets t;
+
+EXEC sys.sp_executesql @sql;
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted] WITH (STATE = ON);
+GO
+
+---------------------------------------------------------------
+-- STEP 4 — XE SESSION: Export / Leakage Signals -> .xel
+---------------------------------------------------------------
+USE master;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'XE_TERA_ExportSignals')
+    DROP EVENT SESSION [XE_TERA_ExportSignals] ON SERVER;
+GO
+
+CREATE EVENT SESSION [XE_TERA_ExportSignals]
+ON SERVER
+ADD EVENT sqlserver.sql_statement_completed
+(
+    ACTION
+    (
+        sqlserver.database_name,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.username,
+        sqlserver.session_id,
+        sqlserver.client_connection_id,
+        sqlserver.sql_text
+    )
+    WHERE
+    (
+        sqlserver.database_name = N'TERA'
+        AND
+        (
+            [row_count] >= 1000
+            OR sqlserver.sql_text LIKE N'%FOR JSON%'
+            OR sqlserver.sql_text LIKE N'%FOR XML%'
+            OR sqlserver.sql_text LIKE N'%OPENROWSET%'
+            OR sqlserver.sql_text LIKE N'%BULK%'
+            OR sqlserver.sql_text LIKE N'%xp_cmdshell%'
+        )
+    )
+)
+ADD TARGET package0.event_file
+(
+    SET filename = N'R:\SQLAudit\TERA\XE_TERA_ExportSignals.xel',
+        max_file_size = 200,
+        max_rollover_files = 10
+);
+GO
+
+ALTER EVENT SESSION [XE_TERA_ExportSignals] ON SERVER STATE = START;
+GO
+
+---------------------------------------------------------------
+-- STEP 5 — TABLES
+---------------------------------------------------------------
+USE TERA;
+GO
+
+IF OBJECT_ID(N'dbo.Audit_ExcludeLogins', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ExcludeLogins
+  (
+      login_name SYSNAME NOT NULL PRIMARY KEY,
+      reason     NVARCHAR(200) NULL,
+      created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+MERGE dbo.Audit_ExcludeLogins AS t
+USING (VALUES
+   (N'sa', N'system'),
+   (N'NT SERVICE\SQLSERVERAGENT', N'sql agent'),
+   (N'NT SERVICE\MSSQLSERVER', N'sql engine')
+) AS s(login_name, reason)
+ON t.login_name = s.login_name
+WHEN NOT MATCHED THEN
+  INSERT (login_name, reason) VALUES (s.login_name, s.reason);
+GO
+
+IF OBJECT_ID(N'dbo.Audit_SensitiveKeywords', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_SensitiveKeywords
+  (
+      keyword SYSNAME NOT NULL PRIMARY KEY,
+      category NVARCHAR(50) NULL,
+      risk_level NVARCHAR(10) NULL,
+      created_at_utc DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+END
+GO
+
+MERGE dbo.Audit_SensitiveKeywords AS t
+USING (VALUES
+    (N'SSN',        N'PII', N'High'),
+    (N'DOB',        N'PII', N'High'),
+    (N'DateOfBirth',N'PII', N'High'),
+    (N'Email',      N'PII', N'Med'),
+    (N'EmailAddress',N'PII', N'Med'),
+    (N'Phone',      N'PII', N'Med'),
+    (N'PhoneNumber',N'PII', N'Med'),
+    (N'Mobile',     N'PII', N'Med'),
+    (N'Cell',       N'PII', N'Med'),
+    (N'FirstName',  N'PII', N'Low'),
+    (N'LastName',   N'PII', N'Low'),
+    (N'FullName',   N'PII', N'Low'),
+    (N'PatientName',N'PII', N'Low'),
+    (N'Patient_First_Name',N'PII', N'Low'),
+    (N'Patient_Last_Name', N'PII', N'Low'),
+    (N'DEA',        N'PHI', N'High'),
+    (N'DEANumber',  N'PHI', N'High')
+) AS s(keyword, category, risk_level)
+ON t.keyword = s.keyword
+WHEN NOT MATCHED THEN
+  INSERT (keyword, category, risk_level) VALUES (s.keyword, s.category, s.risk_level)
+WHEN MATCHED THEN
+  UPDATE SET category = s.category, risk_level = s.risk_level;
+GO
+
+IF OBJECT_ID(N'dbo.Audit_ADGroupCategory', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_ADGroupCategory
+  (
+      ad_group SYSNAME NOT NULL PRIMARY KEY,
+      category VARCHAR(20) NOT NULL
+  );
+END
+GO
+
+-- ===== EDIT AD GROUPS IF NEEDED =====
+MERGE dbo.Audit_ADGroupCategory AS t
+USING (VALUES
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EBI_RO',  'Business'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDP_RO',  'Tech'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EAA_RO',  'Business'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-PBI_RO',  'Business'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_Adm', 'Tech'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_RW',  'Tech'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDM_RO',  'Business'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_ADM', 'Tech'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_RW',  'Tech'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EDG_RO',  'Business'),
+    (N'ARDENTHEALTH\Sec_SQL_Tera-EA_RW',   'Tech')
+) AS s(ad_group, category)
+ON t.ad_group = s.ad_group
+WHEN NOT MATCHED THEN INSERT(ad_group, category) VALUES(s.ad_group, s.category)
+WHEN MATCHED THEN UPDATE SET category = s.category;
+GO
+
+IF OBJECT_ID(N'dbo.Audit_UserCategoryCache', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_UserCategoryCache(
+    login_name SYSNAME NOT NULL,
+    category VARCHAR(20) NOT NULL,
+    matched_group SYSNAME NULL,
+    refreshed_at_utc DATETIME2(7) NOT NULL CONSTRAINT DF_Audit_UserCategoryCache_ref DEFAULT (SYSUTCDATETIME()),
+    PRIMARY KEY CLUSTERED (login_name ASC)
+  );
+END
+GO
+
+IF OBJECT_ID(N'dbo.Audit_AlertWatermark', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Audit_AlertWatermark
+  (
+      alert_name SYSNAME NOT NULL PRIMARY KEY,
+      last_event_time DATETIME2(7) NOT NULL,
+      last_email_time DATETIME2(7) NULL
+  );
+END
+GO
+
+---------------------------------------------------------------
+-- STEP 6 — VIEWS (Your DEV exact)
+---------------------------------------------------------------
+CREATE OR ALTER VIEW dbo.v_Audit_All
+AS
+SELECT
+  event_time,
+  action_id,
+  succeeded,
+  server_principal_name,
+  database_name,
+  schema_name,
+  object_name,
+  statement,
+  client_ip,
+  application_name
+FROM sys.fn_get_audit_file(N'R:\SQLAudit\TERA\*.sqlaudit', DEFAULT, DEFAULT);
+GO
+
+CREATE OR ALTER VIEW dbo.v_Audit_PHI_Selects
+AS
+SELECT *
+FROM dbo.v_Audit_All
+WHERE action_id = 'SL'
+  AND database_name = 'TERA';
+GO
+
+CREATE OR ALTER VIEW dbo.v_Report_PotentialExport
+AS
+WITH x AS
+(
+    SELECT CAST(event_data AS XML) AS xdata
+    FROM sys.fn_xe_file_target_read_file(
+        N'R:\SQLAudit\TERA\XE_TERA_ExportSignals*.xel',
+        NULL, NULL, NULL
+    )
+),
+raw AS
+(
+    SELECT
+        xdata.value('(event/@timestamp)[1]','datetime2(7)') AS event_time_utc,
+        xdata.value('(event/data[@name="row_count"]/value)[1]','bigint') AS row_count,
+        xdata.value('(event/action[@name="username"]/value)[1]','nvarchar(256)') AS login_name,
+        xdata.value('(event/action[@name="client_app_name"]/value)[1]','nvarchar(256)') AS application_name,
+        xdata.value('(event/action[@name="client_hostname"]/value)[1]','nvarchar(256)') AS client_hostname,
+        xdata.value('(event/action[@name="client_connection_id"]/value)[1]','uniqueidentifier') AS client_connection_id,
+        xdata.value('(event/action[@name="database_name"]/value)[1]','nvarchar(256)') AS database_name,
+        xdata.value('(event/action[@name="sql_text"]/value)[1]','nvarchar(max)') AS sql_text
+    FROM x
+)
+SELECT
+    event_time_utc,
+    login_name,
+    application_name,
+    client_hostname,
+    client_connection_id,
+    row_count,
+    CASE
+        WHEN sql_text LIKE '%FOR JSON%' OR sql_text LIKE '%FOR XML%' THEN 'HIGH'
+        WHEN sql_text LIKE '%OPENROWSET%' OR sql_text LIKE '%xp_cmdshell%' OR sql_text LIKE '%BULK%' THEN 'HIGH'
+        WHEN row_count >= 10000 THEN 'HIGH'
+        WHEN row_count BETWEEN 1000 AND 9999 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS severity,
+    LEFT(REPLACE(REPLACE(sql_text, CHAR(13),' '), CHAR(10),' '), 1200) AS statement_snippet
+FROM raw
+WHERE database_name = 'TERA'
+  AND ISNULL(login_name,'') <> ''
+  AND login_name NOT LIKE 'svc%'
+  AND login_name NOT LIKE 'NT SERVICE\%'
+  AND NOT EXISTS (SELECT 1 FROM dbo.Audit_ExcludeLogins e WHERE e.login_name = raw.login_name);
+GO
+
+---------------------------------------------------------------
+-- STEP 7 — PROCEDURES (Your DEV exact)
+---------------------------------------------------------------
+CREATE OR ALTER PROCEDURE dbo.usp_Refresh_AuditUserCategoryCache
+  @LookbackHours INT = 168
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @since DATETIME2(7) = DATEADD(HOUR, -@LookbackHours, SYSUTCDATETIME());
+
+  IF OBJECT_ID('tempdb..#Logins') IS NOT NULL DROP TABLE #Logins;
+
+  SELECT DISTINCT server_principal_name AS login_name
+  INTO #Logins
+  FROM dbo.v_Audit_All
+  WHERE event_time >= @since
+    AND server_principal_name IS NOT NULL
+    AND server_principal_name <> N''
+    AND server_principal_name NOT LIKE 'svc%'
+    AND server_principal_name NOT LIKE 'NT SERVICE\%'
+    AND server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins);
+
+  DECLARE @login SYSNAME;
+
+  DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+    SELECT login_name FROM #Logins;
+
+  OPEN c;
+  FETCH NEXT FROM c INTO @login;
+
+  WHILE @@FETCH_STATUS = 0
+  BEGIN
+    DECLARE @matchedGroup SYSNAME = NULL;
+    DECLARE @category VARCHAR(20) = 'Unknown';
+
+    IF OBJECT_ID('tempdb..#groups') IS NOT NULL DROP TABLE #groups;
+    CREATE TABLE #groups
+    (
+      accountname SYSNAME NULL,
+      type SYSNAME NULL,
+      privilege SYSNAME NULL,
+      mappedloginname SYSNAME NULL,
+      permissionpath SYSNAME NULL
+    );
+
+    BEGIN TRY
+      INSERT #groups
+      EXEC master..xp_logininfo @acctname = @login, @option = 'all';
+    END TRY
+    BEGIN CATCH
+      -- keep Unknown
+    END CATCH
+
+    SELECT TOP (1)
+      @matchedGroup = m.ad_group,
+      @category = m.category
+    FROM dbo.Audit_ADGroupCategory m
+    JOIN #groups g
+      ON g.permissionpath = m.ad_group
+      OR g.accountname = m.ad_group;
+
+    MERGE dbo.Audit_UserCategoryCache AS t
+    USING (SELECT @login AS login_name) AS s
+      ON t.login_name = s.login_name
+    WHEN MATCHED THEN
+      UPDATE SET category = @category,
+                 matched_group = @matchedGroup,
+                 refreshed_at_utc = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT(login_name, category, matched_group, refreshed_at_utc)
+      VALUES(@login, @category, @matchedGroup, SYSUTCDATETIME());
+
+    FETCH NEXT FROM c INTO @login;
+  END
+
+  CLOSE c;
+  DEALLOCATE c;
+END
+GO
+
+/* ===========================
+   ALERT PROC (DEV exact)
+   =========================== */
+CREATE OR ALTER PROCEDURE dbo.usp_Alert_PHI_WhereSensitive_NewOnly
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @SafetyOverlapSeconds INT = 30,
+    @MaxRowsPerEmail INT = 200,
+    @CooldownSeconds INT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @last DATETIME2(7), @lastEmail DATETIME2(7);
+
+    SELECT
+      @last = last_event_time,
+      @lastEmail = last_email_time
+    FROM dbo.Audit_AlertWatermark
+    WHERE alert_name = N'PHI_WhereSensitive';
+
+    IF @last IS NULL
+    BEGIN
+      SET @last = '1900-01-01T00:00:00';
+      IF NOT EXISTS (SELECT 1 FROM dbo.Audit_AlertWatermark WHERE alert_name=N'PHI_WhereSensitive')
+        INSERT dbo.Audit_AlertWatermark(alert_name,last_event_time,last_email_time)
+        VALUES (N'PHI_WhereSensitive', @last, NULL);
+    END
+
+    DECLARE @now DATETIME2(7) = SYSUTCDATETIME();
+
+    IF @CooldownSeconds > 0 AND @lastEmail IS NOT NULL
+    BEGIN
+      IF DATEDIFF(SECOND, @lastEmail, @now) < @CooldownSeconds
+      BEGIN
+        UPDATE dbo.Audit_AlertWatermark
+          SET last_event_time = @now
+        WHERE alert_name = N'PHI_WhereSensitive';
+        RETURN;
+      END
+    END
+
+    DECLARE @since DATETIME2(7) = DATEADD(SECOND, -@SafetyOverlapSeconds, @last);
+
+    EXEC dbo.usp_Refresh_AuditUserCategoryCache;
+
+    ;WITH base AS
+    (
+      SELECT TOP (@MaxRowsPerEmail)
+          a.event_time,
+          a.server_principal_name AS login_name,
+          COALESCE(c.category,'Unknown') AS user_category,
+          c.matched_group,
+          a.schema_name,
+          a.object_name,
+          a.client_ip,
+          a.application_name,
+          a.statement,
+          LOWER(a.statement) AS stmt_l
+      FROM dbo.v_Audit_PHI_Selects a
+      LEFT JOIN dbo.Audit_UserCategoryCache c
+        ON c.login_name = a.server_principal_name
+      WHERE a.event_time > @since
+        AND a.event_time <= @now
+        AND a.server_principal_name IS NOT NULL
+        AND LTRIM(RTRIM(a.server_principal_name)) <> N''
+        AND a.server_principal_name NOT LIKE 'svc%'
+        AND a.server_principal_name NOT LIKE 'NT SERVICE\%'
+        AND a.server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins)
+        AND LOWER(a.statement) LIKE '% where %'
+      ORDER BY a.event_time DESC
+    ),
+    tagged AS
+    (
+      SELECT
+        b.*,
+        sk.keyword AS matched_keyword,
+        SUBSTRING(b.stmt_l, CHARINDEX(' where ', b.stmt_l), 4000) AS where_text,
+        CASE WHEN b.stmt_l LIKE 'select %*%' THEN 1 ELSE 0 END AS is_select_star,
+        CASE WHEN b.stmt_l LIKE '% top %' THEN 1 ELSE 0 END AS has_top,
+        CASE WHEN b.stmt_l LIKE '% where %' THEN 1 ELSE 0 END AS has_where,
+        CASE WHEN b.stmt_l LIKE '%select into%' OR b.stmt_l LIKE '%openrowset%' OR b.stmt_l LIKE '%bulk%' THEN 1 ELSE 0 END AS has_export_ops,
+        CASE
+          WHEN b.application_name LIKE '%Management Studio%' THEN 1
+          WHEN b.application_name LIKE '%Excel%' THEN 1
+          WHEN b.application_name LIKE '%Power BI%' THEN 1
+          WHEN b.application_name LIKE '%ODBC%' THEN 1
+          WHEN b.application_name LIKE '%OLE DB%' THEN 1
+          ELSE 0
+        END AS is_export_tool
+      FROM base b
+      OUTER APPLY
+      (
+        SELECT TOP (1) keyword
+        FROM dbo.Audit_SensitiveKeywords
+        WHERE b.stmt_l LIKE '% where %'
+          AND b.stmt_l LIKE '%' + LOWER(keyword) + '%'
+        ORDER BY keyword
+      ) sk
+      WHERE sk.keyword IS NOT NULL
+    )
+    SELECT
+      event_time,
+      login_name,
+      user_category,
+      matched_group,
+      schema_name,
+      object_name,
+      client_ip,
+      application_name,
+      matched_keyword,
+      where_text,
+      CASE
+        WHEN (has_export_ops = 1 OR (is_select_star = 1 AND has_top = 0)) AND is_export_tool = 1
+        THEN 'POTENTIAL_EXPORT'
+        WHEN user_category IN ('Business','Unknown') AND matched_keyword IN ('SSN','DEA','DEANumber') THEN 'HIGH'
+        WHEN matched_keyword IN ('SSN','DEA','DEANumber')
+             AND (stmt_l LIKE '% like %' OR stmt_l LIKE '% in (%' OR stmt_l LIKE '% between %' OR stmt_l LIKE '%>=%' OR stmt_l LIKE '%<=%')
+        THEN 'HIGH'
+        WHEN user_category IN ('Business','Unknown')
+             AND matched_keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                     'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+        THEN 'MEDIUM'
+        WHEN user_category = 'Tech' AND matched_keyword IN ('SSN','DEA','DEANumber') THEN 'MEDIUM'
+        WHEN user_category = 'Tech'
+             AND matched_keyword IN ('DOB','DateOfBirth','Email','EmailAddress','Phone','PhoneNumber','Mobile','Cell',
+                                     'FirstName','LastName','FullName','PatientName','Patient_First_Name','Patient_Last_Name')
+        THEN 'LOW'
+        ELSE 'MEDIUM'
+      END AS severity
+    INTO #NewHits
+    FROM tagged;
+
+    IF NOT EXISTS (SELECT 1 FROM #NewHits)
+    BEGIN
+      UPDATE dbo.Audit_AlertWatermark
+        SET last_event_time = @now
+      WHERE alert_name = N'PHI_WhereSensitive';
+      RETURN;
+    END
+
+    DECLARE @HasHigh BIT = CASE WHEN EXISTS (SELECT 1 FROM #NewHits WHERE severity IN ('HIGH','POTENTIAL_EXPORT')) THEN 1 ELSE 0 END;
+
+    DECLARE @subject NVARCHAR(200) =
+      CASE WHEN @HasHigh=1
+           THEN N'ALERT: PHI WHERE-Sensitive Access (Near Real-Time) - HIGH/EXPORT'
+           ELSE N'ALERT: PHI WHERE-Sensitive Access (Near Real-Time)'
+      END;
+
+    DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%; table-layout:fixed;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word; white-space:normal;}
+  th{background:#f3f3f3;}
+  .col-time{width:150px;}
+  .col-sev{width:140px;}
+  .col-cat{width:90px;}
+  .col-login{width:190px;}
+  .col-group{width:240px;}
+  .col-obj{width:240px;}
+  .col-ip{width:120px;}
+  .col-app{width:220px;}
+  .col-key{width:120px;}
+  .col-where{width:auto;}
+</style>';
+
+    DECLARE @header NVARCHAR(MAX) =
+      N'<table><tr>'
+      + N'<th class="col-time">event_time</th>'
+      + N'<th class="col-sev">severity</th>'
+      + N'<th class="col-cat">category</th>'
+      + N'<th class="col-login">login</th>'
+      + N'<th class="col-group">matched AD group</th>'
+      + N'<th class="col-obj">object</th>'
+      + N'<th class="col-ip">client_ip</th>'
+      + N'<th class="col-app">application</th>'
+      + N'<th class="col-key">keyword</th>'
+      + N'<th class="col-where">WHERE snippet</th>'
+      + N'</tr>';
+
+    DECLARE @BusinessRows NVARCHAR(MAX) = N'';
+    DECLARE @TechRows NVARCHAR(MAX) = N'';
+    DECLARE @UnknownRows NVARCHAR(MAX) = N'';
+
+    SELECT @BusinessRows =
+    (
+      SELECT N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-sev">' + severity + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + login_name + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+        + N'</tr>'
+      FROM #NewHits
+      WHERE user_category = 'Business'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'POTENTIAL_EXPORT' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 9 END,
+               event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SELECT @TechRows =
+    (
+      SELECT N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-sev">' + severity + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + login_name + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+        + N'</tr>'
+      FROM #NewHits
+      WHERE user_category = 'Tech'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'POTENTIAL_EXPORT' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 9 END,
+               event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    SELECT @UnknownRows =
+    (
+      SELECT N'<tr>'
+        + N'<td class="col-time">' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+        + N'<td class="col-sev">' + severity + N'</td>'
+        + N'<td class="col-cat">' + user_category + N'</td>'
+        + N'<td class="col-login">' + login_name + N'</td>'
+        + N'<td class="col-group">' + ISNULL(matched_group,N'') + N'</td>'
+        + N'<td class="col-obj">' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+        + N'<td class="col-ip">' + ISNULL(client_ip,N'') + N'</td>'
+        + N'<td class="col-app">' + ISNULL(application_name,N'') + N'</td>'
+        + N'<td class="col-key">' + ISNULL(matched_keyword,N'') + N'</td>'
+        + N'<td class="col-where">' + LEFT(REPLACE(REPLACE(ISNULL(where_text,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+        + N'</tr>'
+      FROM #NewHits
+      WHERE user_category = 'Unknown'
+      ORDER BY CASE severity WHEN 'HIGH' THEN 1 WHEN 'POTENTIAL_EXPORT' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 9 END,
+               event_time DESC
+      FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)');
+
+    DECLARE @html NVARCHAR(MAX) =
+        @style
+      + N'<h2>PHI WHERE-Sensitive Access Alert</h2>'
+      + N'<p><b>Generated (UTC):</b> ' + CONVERT(NVARCHAR(30), @now, 126) + N'</p>'
+      + N'<p><b>Scan window (UTC):</b> ' + CONVERT(NVARCHAR(30), @since, 126)
+      + N' to ' + CONVERT(NVARCHAR(30), @now, 126) + N'</p>';
+
+    SET @html += N'<h3>Business</h3>'
+      + CASE WHEN @BusinessRows IS NULL OR LEN(@BusinessRows)=0
+             THEN N'<p><b>No new Business hits.</b></p>'
+             ELSE @header + @BusinessRows + N'</table>' END;
+
+    SET @html += N'<h3>Tech</h3>'
+      + CASE WHEN @TechRows IS NULL OR LEN(@TechRows)=0
+             THEN N'<p><b>No new Tech hits.</b></p>'
+             ELSE @header + @TechRows + N'</table>' END;
+
+    SET @html += N'<h3>Unknown</h3>'
+      + CASE WHEN @UnknownRows IS NULL OR LEN(@UnknownRows)=0
+             THEN N'<p><b>No new Unknown hits.</b></p>'
+             ELSE @header + @UnknownRows + N'</table>' END;
+
+    EXEC msdb.dbo.sp_send_dbmail
+      @profile_name = @ProfileName,
+      @recipients   = @Recipients,
+      @subject      = @subject,
+      @body         = @html,
+      @body_format  = 'HTML';
+
+    UPDATE dbo.Audit_AlertWatermark
+      SET last_event_time = @now,
+          last_email_time = @now
+    WHERE alert_name = N'PHI_WhereSensitive';
+END
+GO
+
+/* ===========================
+   WEEKLY PACK PROC (DEV exact)
+   =========================== */
+CREATE OR ALTER PROCEDURE dbo.usp_Email_Weekly_Audit_Pack
+    @ProfileName SYSNAME,
+    @Recipients  NVARCHAR(MAX),
+    @WeekStart   DATE = NULL,
+    @WeekEnd     DATE = NULL,
+    @MaxRowsPerSection INT = 200
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @utcToday DATE = CONVERT(DATE, SYSUTCDATETIME());
+
+    IF @WeekStart IS NULL
+    BEGIN
+        DECLARE @dow INT = (DATEPART(WEEKDAY, @utcToday) + @@DATEFIRST - 2) % 7; -- 0=Mon
+        SET @WeekStart = DATEADD(DAY, -@dow, @utcToday);
+    END
+
+    IF @WeekEnd IS NULL
+        SET @WeekEnd = DATEADD(DAY, 7, @WeekStart);
+
+    DECLARE @StartDT DATETIME2(7) = CAST(@WeekStart AS DATETIME2(7));
+    DECLARE @EndDT   DATETIME2(7) = CAST(@WeekEnd   AS DATETIME2(7));
+
+    DECLARE @style NVARCHAR(MAX) = N'
+<style>
+  body{font-family:Segoe UI, Arial; font-size:10pt;}
+  table{border-collapse:collapse; width:100%;}
+  th,td{border:1px solid #cfcfcf; padding:6px; vertical-align:top; word-break:break-word;}
+  th{background:#f3f3f3;}
+</style>';
+
+    DECLARE @html NVARCHAR(MAX) =
+        @style
+      + N'<h2>Weekly Audit Pack - TERA</h2>'
+      + N'<p><b>Window (UTC):</b> ' + CONVERT(NVARCHAR(10), @WeekStart, 120)
+      + N' to ' + CONVERT(NVARCHAR(10), @WeekEnd, 120) + N'</p>';
+
+    DECLARE @rows NVARCHAR(MAX) = N'';
+
+    /* SECTION 1: Failed Logins (LGIF) - Human-ish */
+    SELECT @rows = ISNULL((
+        SELECT TOP (@MaxRowsPerSection)
+            N'<tr><td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td>' + ISNULL(server_principal_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td></tr>'
+        FROM dbo.v_Audit_All
+        WHERE event_time >= @StartDT AND event_time < @EndDT
+          AND action_id = 'LGIF'
+          AND ISNULL(server_principal_name,N'') <> N''
+          AND server_principal_name NOT LIKE 'svc%'
+          AND server_principal_name NOT LIKE 'NT SERVICE\%'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)'), N'');
+
+    SET @html += N'<h3>Failed Logins (Human)</h3>'
+      + CASE WHEN LEN(@rows)=0
+             THEN N'<p><b>No failed logins found in this window.</b></p>'
+             ELSE N'<table><tr><th>event_time</th><th>login</th><th>client_ip</th><th>application</th><th>message</th></tr>'
+               + @rows + N'</table>' END;
+
+    /* SECTION 2: Table Drops (DR) */
+    SET @rows = N'';
+    SELECT @rows = ISNULL((
+        SELECT TOP (@MaxRowsPerSection)
+            N'<tr><td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td>' + ISNULL(server_principal_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(database_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td></tr>'
+        FROM dbo.v_Audit_All
+        WHERE event_time >= @StartDT AND event_time < @EndDT
+          AND action_id = 'DR'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)'), N'');
+
+    SET @html += N'<h3>Table / Object Drops</h3>'
+      + CASE WHEN LEN(@rows)=0
+             THEN N'<p><b>No drop events found in this window.</b></p>'
+             ELSE N'<table><tr><th>event_time</th><th>login</th><th>db</th><th>object</th><th>client_ip</th><th>application</th><th>statement</th></tr>'
+               + @rows + N'</table>' END;
+
+    /* TRUNCATE TABLE (TR) */
+    SET @rows = N'';
+    SELECT @rows = ISNULL((
+        SELECT TOP (@MaxRowsPerSection)
+            N'<tr><td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td>' + ISNULL(server_principal_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(database_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td></tr>'
+        FROM dbo.v_Audit_All
+        WHERE event_time >= @StartDT AND event_time < @EndDT
+          AND action_id = 'TR'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)'), N'');
+
+    SET @html += N'<h3>TRUNCATE TABLE Events (HIGH RISK)</h3>'
+      + CASE WHEN LEN(@rows)=0
+             THEN N'<p><b>No TRUNCATE TABLE events found in this window.</b></p>'
+             ELSE N'<table><tr><th>event_time</th><th>login</th><th>db</th><th>object</th><th>client_ip</th><th>application</th><th>statement</th></tr>'
+               + @rows + N'</table>' END;
+
+    /* Potential Export */
+    SET @rows = N'';
+    SELECT @rows = ISNULL((
+        SELECT TOP (@MaxRowsPerSection)
+            N'<tr>'
+          + N'<td>' + CONVERT(NVARCHAR(19), event_time_utc, 120) + N'</td>'
+          + N'<td><b>' + ISNULL(severity,N'') + N'</b></td>'
+          + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(client_hostname,N'') + N'</td>'
+          + N'<td>' + ISNULL(CAST(row_count AS NVARCHAR(20)), N'') + N'</td>'
+          + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement_snippet,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+          + N'</tr>'
+        FROM dbo.v_Report_PotentialExport
+        WHERE event_time_utc >= @StartDT AND event_time_utc < @EndDT
+        ORDER BY
+            CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 9 END,
+            event_time_utc DESC
+        FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)'), N'');
+
+    SET @html += N'<h3>Potential Export / Data Leakage Signals</h3>'
+      + N'<p>Signals include high row-count extracts and export-like query patterns (FOR JSON/XML, OPENROWSET/BULK, etc.).</p>'
+      + CASE WHEN LEN(@rows)=0
+             THEN N'<p><b>No potential export signals found in this window.</b></p>'
+             ELSE N'<table><tr>'
+                + N'<th>event_time_utc</th><th>severity</th><th>login</th><th>application</th><th>host</th><th>row_count</th><th>statement_snippet</th>'
+                + N'</tr>' + @rows + N'</table>' END;
+
+    /* SELECT Activity */
+    SET @rows = N'';
+    SELECT @rows = ISNULL((
+        SELECT TOP (@MaxRowsPerSection)
+            N'<tr><td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+          + N'<td>' + ISNULL(server_principal_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(database_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+          + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+          + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+          + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td></tr>'
+        FROM dbo.v_Audit_All
+        WHERE event_time >= @StartDT AND event_time < @EndDT
+          AND action_id = 'SL'
+          AND database_name = 'TERA'
+        ORDER BY event_time DESC
+        FOR XML PATH(''), TYPE
+    ).value('.','nvarchar(max)'), N'');
+
+    SET @html += N'<h3>SELECT Activity (SL) - TERA</h3>'
+      + CASE WHEN LEN(@rows)=0
+             THEN N'<p><b>No SELECT events found in this window.</b></p>'
+             ELSE N'<table><tr><th>event_time</th><th>login</th><th>db</th><th>object</th><th>client_ip</th><th>application</th><th>statement</th></tr>'
+               + @rows + N'</table>' END;
+
+    IF @html IS NULL OR LEN(@html) < 300
+        SET @html = @style + N'<h2>Weekly Audit Pack - TERA</h2><p>No audit events matched filters in this window.</p>';
+
+    DECLARE @subject NVARCHAR(200) =
+      N'Weekly Audit Pack - TERA (' + CONVERT(NVARCHAR(10), @WeekStart, 120) + N' to ' + CONVERT(NVARCHAR(10), @WeekEnd, 120) + N')';
+
+    EXEC msdb.dbo.sp_send_dbmail
+      @profile_name = @ProfileName,
+      @recipients   = @Recipients,
+      @subject      = @subject,
+      @body         = @html,
+      @body_format  = 'HTML';
+END
+GO
+
+---------------------------------------------------------------
+-- STEP 8 — SQL AGENT JOBS
+---------------------------------------------------------------
+USE msdb;
+GO
+
+-- A) Near real-time alert (every 10 seconds)
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'ALERT_TERA_PHI_WhereSensitive_10sec')
+  EXEC msdb.dbo.sp_delete_job @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec';
+GO
+
+EXEC msdb.dbo.sp_add_job
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @enabled = 1,
+  @description = N'Near-real-time alert: PHI SELECT with WHERE on sensitive fields (every 10 seconds).';
+GO
+
+EXEC msdb.dbo.sp_add_jobstep
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @step_name = N'Send New Alerts',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'
+EXEC dbo.usp_Alert_PHI_WhereSensitive_NewOnly
+  @ProfileName = N''DBA-Mail'',
+  @Recipients  = N''security@company.com;dba@company.com'',
+  @SafetyOverlapSeconds = 30,
+  @MaxRowsPerEmail = 200,
+  @CooldownSeconds = 0;';
+GO
+
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysschedules WHERE name = N'Every_10_Seconds')
+BEGIN
+  EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = N'Every_10_Seconds',
+    @freq_type = 4,
+    @freq_interval = 1,
+    @freq_subday_type = 2,
+    @freq_subday_interval = 10,
+    @active_start_time = 000000;
+END
+GO
+
+EXEC msdb.dbo.sp_attach_schedule
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec',
+  @schedule_name = N'Every_10_Seconds';
+GO
+
+EXEC msdb.dbo.sp_add_jobserver
+  @job_name = N'ALERT_TERA_PHI_WhereSensitive_10sec';
+GO
+
+-- B) Weekly Audit Pack (Monday 7:00 AM)
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'EMAIL_TERA_Weekly_AuditPack')
+  EXEC msdb.dbo.sp_delete_job @job_name = N'EMAIL_TERA_Weekly_AuditPack';
+GO
+
+EXEC msdb.dbo.sp_add_job
+  @job_name = N'EMAIL_TERA_Weekly_AuditPack',
+  @enabled = 1,
+  @description = N'Send Weekly Audit Pack - TERA (Mon 7AM).';
+GO
+
+EXEC msdb.dbo.sp_add_jobstep
+  @job_name = N'EMAIL_TERA_Weekly_AuditPack',
+  @step_name = N'Send Weekly Pack',
+  @subsystem = N'TSQL',
+  @database_name = N'TERA',
+  @command = N'
+EXEC dbo.usp_Email_Weekly_Audit_Pack
+  @ProfileName = N''DBA-Mail'',
+  @Recipients  = N''security@company.com;dba@company.com'',
+  @WeekStart   = NULL,
+  @WeekEnd     = NULL,
+  @MaxRowsPerSection = 200;';
+GO
+
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysschedules WHERE name = N'Weekly_Mon_0700')
+BEGIN
+  EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = N'Weekly_Mon_0700',
+    @freq_type = 8,
+    @freq_interval = 2,
+    @active_start_time = 070000;
+END
+GO
+
+EXEC msdb.dbo.sp_attach_schedule
+  @job_name = N'EMAIL_TERA_Weekly_AuditPack',
+  @schedule_name = N'Weekly_Mon_0700';
+GO
+
+EXEC msdb.dbo.sp_add_jobserver
+  @job_name = N'EMAIL_TERA_Weekly_AuditPack';
+GO
+
+---------------------------------------------------------------
+-- STEP 9 — QUICK VALIDATION QUERIES
+---------------------------------------------------------------
+USE TERA;
+GO
+
+PRINT 'Validation: Server Audit ON?';
+SELECT name, is_state_enabled FROM sys.server_audits WHERE name = 'AUD_Prod_TERAToFile';
+
+PRINT 'Validation: DB Audit Spec ON?';
+SELECT name, is_state_enabled FROM sys.database_audit_specifications WHERE name = 'AUDSPEC_TERA_Select_Targeted';
+
+PRINT 'Validation: recent audit rows';
+SELECT TOP 10 * FROM dbo.v_Audit_All ORDER BY event_time DESC;
+
+PRINT 'Validation: recent export signals';
+SELECT TOP 10 * FROM dbo.v_Report_PotentialExport ORDER BY event_time_utc DESC;
+GO
+
++++++++++++++After running this in PROD++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+EXEC TERA.dbo.usp_Email_Weekly_Audit_Pack
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'your_email@company.com',
+  @WeekStart   = DATEADD(DAY,-1, CONVERT(date,SYSUTCDATETIME())),
+  @WeekEnd     = CONVERT(date,SYSUTCDATETIME()),
+  @MaxRowsPerSection = 50;
+
+
