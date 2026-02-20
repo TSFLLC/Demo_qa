@@ -352,4 +352,148 @@ SELECT
 FROM sys.fn_get_audit_file(N'R:\SQLAudit\TERA\*.sqlaudit', DEFAULT, DEFAULT);
 GO
 
+
+--------------------------------------------------------------------------
+
+USE [TERA]
+GO
+
+/****** Object:  View [dbo].[v_Audit_PHI_Selects]    Script Date: 2/20/2026 11:26:02 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   VIEW [dbo].[v_Audit_PHI_Selects]
+AS
+SELECT *
+FROM dbo.v_Audit_All
+WHERE action_id = 'SL'  -- SELECT
+  AND database_name = 'TERA';
+GO
+
+
+---------------
+
+USE [TERA]
+GO
+
+/****** Object:  Table [dbo].[Audit_UserCategoryCache]    Script Date: 2/20/2026 11:27:32 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[Audit_UserCategoryCache](
+	[login_name] [sysname] NOT NULL,
+	[category] [varchar](20) NOT NULL,
+	[matched_group] [sysname] NULL,
+	[refreshed_at_utc] [datetime2](7) NOT NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[login_name] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+ALTER TABLE [dbo].[Audit_UserCategoryCache] ADD  DEFAULT (sysutcdatetime()) FOR [refreshed_at_utc]
+GO
+
+-----------------------
+
+USE [TERA]
+GO
+
+/****** Object:  StoredProcedure [dbo].[usp_Refresh_AuditUserCategoryCache]    Script Date: 2/20/2026 11:28:32 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [dbo].[usp_Refresh_AuditUserCategoryCache]
+  @LookbackHours INT = 168
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @since DATETIME2(7) = DATEADD(HOUR, -@LookbackHours, SYSUTCDATETIME());
+
+  /* Pull distinct logins from audit data (base view) */
+  IF OBJECT_ID('tempdb..#Logins') IS NOT NULL DROP TABLE #Logins;
+
+  SELECT DISTINCT server_principal_name AS login_name
+  INTO #Logins
+  FROM dbo.v_Audit_All
+  WHERE event_time >= @since
+    AND server_principal_name IS NOT NULL
+    AND server_principal_name <> N''
+    AND server_principal_name NOT LIKE 'svc%'
+    AND server_principal_name NOT LIKE 'NT SERVICE\%'
+    AND server_principal_name NOT IN (SELECT login_name FROM dbo.Audit_ExcludeLogins);
+
+  /* For each login, find first matching AD group from mapping */
+  DECLARE @login SYSNAME;
+
+  DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+    SELECT login_name FROM #Logins;
+
+  OPEN c;
+  FETCH NEXT FROM c INTO @login;
+
+  WHILE @@FETCH_STATUS = 0
+  BEGIN
+    DECLARE @matchedGroup SYSNAME = NULL;
+    DECLARE @category VARCHAR(20) = 'Unknown';
+
+    -- xp_logininfo returns groups a user belongs to (domain required)
+    IF OBJECT_ID('tempdb..#groups') IS NOT NULL DROP TABLE #groups;
+    CREATE TABLE #groups
+    (
+      accountname SYSNAME NULL,
+      type SYSNAME NULL,
+      privilege SYSNAME NULL,
+      mappedloginname SYSNAME NULL,
+      permissionpath SYSNAME NULL
+    );
+
+    BEGIN TRY
+      INSERT #groups
+      EXEC master..xp_logininfo @acctname = @login, @option = 'all';
+    END TRY
+    BEGIN CATCH
+      -- If xp_logininfo fails, keep Unknown
+    END CATCH
+
+    SELECT TOP (1)
+      @matchedGroup = m.ad_group,
+      @category = m.category
+    FROM dbo.Audit_ADGroupCategory m
+    JOIN #groups g
+      ON g.permissionpath = m.ad_group
+      OR g.accountname = m.ad_group;
+
+    MERGE dbo.Audit_UserCategoryCache AS t
+    USING (SELECT @login AS login_name) AS s
+      ON t.login_name = s.login_name
+    WHEN MATCHED THEN
+      UPDATE SET category = @category,
+                 matched_group = @matchedGroup,
+                 refreshed_at_utc = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT(login_name, category, matched_group, refreshed_at_utc)
+      VALUES(@login, @category, @matchedGroup, SYSUTCDATETIME());
+
+    FETCH NEXT FROM c INTO @login;
+  END
+
+  CLOSE c;
+  DEALLOCATE c;
+END
+GO
+
+
+
                                              
