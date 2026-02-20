@@ -1,0 +1,252 @@
+STEP 1 — Verify TRUNCATE is already captured
+SELECT action_id, COUNT(*) AS cnt
+FROM dbo.v_Audit_All
+WHERE event_time >= DATEADD(DAY,-30, SYSUTCDATETIME())
+GROUP BY action_id
+ORDER BY cnt DESC;
+
+++++++++++++++STEP 2 — Enable TRUNCATE auditing (ONLY if missing)++++++++++++++++
+SELECT das.name, dad.audit_action_name
+FROM sys.database_audit_specifications das
+JOIN sys.database_audit_specification_details dad
+  ON das.database_specification_id = dad.database_specification_id
+WHERE das.name = 'AUDSPEC_TERA_Select_Targeted';
+
++++++++++++++++++++++2.2 Add DDL audit group if not present++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+WITH (STATE = OFF);
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+ADD (DATABASE_OBJECT_CHANGE_GROUP);
+GO
+
+ALTER DATABASE AUDIT SPECIFICATION [AUDSPEC_TERA_Select_Targeted]
+WITH (STATE = ON);
+GO
+
++++++++++++++++++STEP 3 — Create a TRUNCATE view (clean separation)+++++++++++++++++++++++++++++++++++++++++
+CREATE OR ALTER VIEW dbo.v_Audit_TruncateTables
+AS
+SELECT
+    event_time,
+    server_principal_name AS login_name,
+    database_name,
+    schema_name,
+    object_name,
+    client_ip,
+    application_name,
+    statement,
+    action_id,
+    succeeded
+FROM dbo.v_Audit_All
+WHERE action_id = 'TR'
+  AND database_name = 'TERA';
+GO
+
+++++++++++++++++STEP 4 — Add TRUNCATE section to Weekly Audit Email++++++++++++++++++++++++++++++++++++++++++++
+/* =======================================================
+   SECTION: TRUNCATE TABLE (TR) – HIGH RISK
+   ======================================================= */
+SET @rows = N'';
+
+SELECT @rows = ISNULL((
+    SELECT TOP (@MaxRowsPerSection)
+        N'<tr><td>' + CONVERT(NVARCHAR(19), event_time, 120) + N'</td>'
+      + N'<td>' + ISNULL(server_principal_name,N'') + N'</td>'
+      + N'<td>' + ISNULL(database_name,N'') + N'</td>'
+      + N'<td>' + ISNULL(schema_name,N'') + N'.' + ISNULL(object_name,N'') + N'</td>'
+      + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+      + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+      + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement,N''),CHAR(13),' '),CHAR(10),' '), 400) + N'</td></tr>'
+    FROM dbo.v_Audit_All
+    WHERE event_time >= @StartDT AND event_time < @EndDT
+      AND action_id = 'TR'
+    ORDER BY event_time DESC
+    FOR XML PATH(''), TYPE
+).value('.','nvarchar(max)'), N'');
+
+SET @html += N'<h3>TRUNCATE TABLE Events (HIGH RISK)</h3>'
+  + CASE WHEN LEN(@rows)=0
+         THEN N'<p><b>No TRUNCATE TABLE events found in this window.</b></p>'
+         ELSE N'<table><tr><th>event_time</th><th>login</th><th>db</th><th>object</th><th>client_ip</th><th>application</th><th>statement</th></tr>'
+           + @rows + N'</table>' END;
+
+
+
++++++++++++++++++++STEP 6 — Test it (2-minute validation)++++++++++++++++++++++++++++++++++++
+TRUNCATE TABLE dbo.Test_Audit_Truncate;
+
++----Wait ~10–15 seconds, then:
+SELECT TOP 10 *
+FROM dbo.v_Audit_TruncateTables
+ORDER BY event_time DESC;
+
+
+///////////////////////////////////////////////////////////////TRACKT EXPORT///////////////////////////////////////////////////////////////////////////////////////////////////////
+++++++++++++++++++Step 2 — Create XE session to capture row_count (key piece)+++++++++++++++++++++++
+-- Run on the SERVER (master is fine)
+IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'XE_TERA_ExportSignals')
+    DROP EVENT SESSION [XE_TERA_ExportSignals] ON SERVER;
+GO
+
+CREATE EVENT SESSION [XE_TERA_ExportSignals]
+ON SERVER
+ADD EVENT sqlserver.sql_statement_completed
+(
+    ACTION
+    (
+        sqlserver.database_name,
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.username,
+        sqlserver.client_ip,
+        sqlserver.session_id,
+        sqlserver.sql_text
+    )
+    WHERE
+    (
+        -- only TERA database statements
+        sqlserver.database_name = N'TERA'
+        AND
+        (
+            -- rowcount signals: big resultsets
+            [row_count] >= 1000
+
+            -- or explicit export-ish formatting
+            OR sqlserver.sql_text LIKE N'%FOR JSON%'
+            OR sqlserver.sql_text LIKE N'%FOR XML%'
+
+            -- or common bulk/external write primitives
+            OR sqlserver.sql_text LIKE N'%OPENROWSET%'
+            OR sqlserver.sql_text LIKE N'%BULK%'
+            OR sqlserver.sql_text LIKE N'%xp_cmdshell%'
+        )
+    )
+)
+ADD TARGET package0.event_file
+(
+    SET filename = N'E:\SQLAudit\XE\XE_TERA_ExportSignals.xel',
+        max_file_size = 200,
+        max_rollover_files = 10
+);
+GO
+
+ALTER EVENT SESSION [XE_TERA_ExportSignals] ON SERVER STATE = START;
+GO
+
+++++++++++++++++Step 3 — Create a view to read XE events (Power BI ready later)++++++++++++++++++++++
+USE TERA;
+GO
+
+CREATE OR ALTER VIEW dbo.v_XE_TERA_ExportSignals
+AS
+WITH x AS
+(
+    SELECT CAST(event_data AS XML) AS xdata
+    FROM sys.fn_xe_file_target_read_file(
+        N'E:\SQLAudit\XE\XE_TERA_ExportSignals*.xel',
+        NULL, NULL, NULL
+    )
+)
+SELECT
+    xdata.value('(event/@timestamp)[1]','datetime2(7)') AS event_time_utc,
+    xdata.value('(event/data[@name="row_count"]/value)[1]','bigint') AS row_count,
+    xdata.value('(event/action[@name="username"]/value)[1]','nvarchar(256)') AS login_name,
+    xdata.value('(event/action[@name="client_app_name"]/value)[1]','nvarchar(256)') AS application_name,
+    xdata.value('(event/action[@name="client_hostname"]/value)[1]','nvarchar(256)') AS client_hostname,
+    xdata.value('(event/action[@name="client_ip"]/value)[1]','nvarchar(64)') AS client_ip,
+    xdata.value('(event/action[@name="database_name"]/value)[1]','nvarchar(256)') AS database_name,
+    xdata.value('(event/action[@name="sql_text"]/value)[1]','nvarchar(max)') AS sql_text
+FROM x;
+GO
+
++++++++++++++++++++Step 4 — Create a “Potential Export” weekly report view (human-only + severity)++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+USE TERA;
+GO
+
+CREATE OR ALTER VIEW dbo.v_Report_PotentialExport
+AS
+SELECT
+    event_time_utc,
+    login_name,
+    application_name,
+    client_hostname,
+    client_ip,
+    row_count,
+    CASE
+        WHEN sql_text LIKE '%FOR JSON%' OR sql_text LIKE '%FOR XML%' THEN 'HIGH'
+        WHEN row_count >= 10000 THEN 'HIGH'
+        WHEN row_count BETWEEN 1000 AND 9999 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS severity,
+    CASE
+        WHEN sql_text LIKE '%OPENROWSET%' OR sql_text LIKE '%xp_cmdshell%' OR sql_text LIKE '%BULK%' THEN 1
+        ELSE 0
+    END AS has_export_primitive,
+    LEFT(REPLACE(REPLACE(sql_text, CHAR(13),' '), CHAR(10),' '), 1200) AS statement_snippet
+FROM dbo.v_XE_TERA_ExportSignals
+WHERE ISNULL(login_name,'') <> ''
+  AND login_name NOT LIKE 'svc%'
+  AND login_name NOT LIKE 'NT SERVICE\%';
+GO
+
+++++++++++++QUICK VALIDATION***************************
+SELECT TOP 20 *
+FROM dbo.v_Report_PotentialExport
+ORDER BY event_time_utc DESC;
+
+
++++++++++++++++✅ 1) Paste this block inside your weekly email stored procedure+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+/* =======================================================
+   SECTION: Potential Export / Data Leakage Signals
+   Source: dbo.v_Report_PotentialExport (XE-based)
+   ======================================================= */
+SET @rows = N'';
+
+SELECT @rows = ISNULL((
+    SELECT TOP (@MaxRowsPerSection)
+        N'<tr>'
+      + N'<td>' + CONVERT(NVARCHAR(19), event_time_utc, 120) + N'</td>'
+      + N'<td><b>' + ISNULL(severity,N'') + N'</b></td>'
+      + N'<td>' + ISNULL(login_name,N'') + N'</td>'
+      + N'<td>' + ISNULL(application_name,N'') + N'</td>'
+      + N'<td>' + ISNULL(client_ip,N'') + N'</td>'
+      + N'<td>' + ISNULL(CAST(row_count AS NVARCHAR(20)), N'') + N'</td>'
+      + N'<td>' + LEFT(REPLACE(REPLACE(ISNULL(statement_snippet,N''),CHAR(13),' '),CHAR(10),' '), 800) + N'</td>'
+      + N'</tr>'
+    FROM dbo.v_Report_PotentialExport
+    WHERE event_time_utc >= @StartDT AND event_time_utc < @EndDT
+    ORDER BY
+        CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 9 END,
+        event_time_utc DESC
+    FOR XML PATH(''), TYPE
+).value('.','nvarchar(max)'), N'');
+
+SET @html += N'<h3>Potential Export / Data Leakage Signals</h3>'
+  + N'<p>Signals include high row-count extracts and export-like query patterns (FOR JSON/XML, OPENROWSET/BULK, etc.).</p>'
+  + CASE WHEN LEN(@rows)=0
+         THEN N'<p><b>No potential export signals found in this window.</b></p>'
+         ELSE N'<table><tr>'
+            + N'<th>event_time_utc</th>'
+            + N'<th>severity</th>'
+            + N'<th>login</th>'
+            + N'<th>application</th>'
+            + N'<th>client_ip</th>'
+            + N'<th>row_count</th>'
+            + N'<th>statement_snippet</th>'
+            + N'</tr>'
+            + @rows + N'</table>' END;
+
+++++++++++++++++++✅ 3) Quick test (no waiting for next week)+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+EXEC dbo.usp_Email_Weekly_Audit_Pack
+  @ProfileName = N'DBA-Mail',
+  @Recipients  = N'your_email@company.com',
+  @WeekStart   = DATEADD(DAY,-2, CONVERT(date, SYSUTCDATETIME())),
+  @WeekEnd     = CONVERT(date, SYSUTCDATETIME()),
+  @MaxRowsPerSection = 50;
+
+
