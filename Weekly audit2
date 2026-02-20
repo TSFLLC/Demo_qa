@@ -1,3 +1,7 @@
+
+
+
+
 STEP 0 — Fill in your audit name + path (edit once)
 
 USE [TERA];
@@ -340,6 +344,108 @@ GROUP BY action_id
 ORDER BY cnt DESC;
 
 
-Then we map the correct action_id values.
++++++++++++++++++++++++++++Verification blank report++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+t can be normal or it can mean your report query is returning zero rows because of filters / action_id mismatch / wrong audit file path. The fastest way to know is to run 3 checks.
+
+1) Confirm the audit view is actually returning rows
+
+Run:
+
+SELECT TOP (20) *
+FROM dbo.v_Audit_All
+ORDER BY event_time DESC;
+
+If this returns 0 rows
+
+Then the weekly email will be blank because the base view is empty. Common causes:
+
+wrong audit file path in sys.fn_get_audit_file
+
+SQL Server service account can’t read the folder/share
+
+audit is writing somewhere else
+
+✅ Fix: correct the path and permissions.
+
+2) Confirm your audit contains the event types you expect
+
+Run:
+
+SELECT TOP (50) action_id, COUNT(*) AS cnt
+FROM dbo.v_Audit_All
+WHERE event_time >= DATEADD(DAY,-7, SYSUTCDATETIME())
+GROUP BY action_id
+ORDER BY cnt DESC;
+
+If you don’t see expected action_ids like:
+
+SL (SELECT)
+
+LGIF (login failed) (depends on what you enabled)
+
+DR/DL (drop) (depends on what you enabled)
+
+Then your view may be fine, but your filters don’t match the actual action_id codes in your audit.
+
+✅ Fix: adjust the report views/proc to use the action_ids you actually have.
+
+3) Confirm the weekly report procedure has data to print
+
+Before sending the email, verify the same timeframe:
+
+DECLARE @StartDT DATETIME2(7) = '2026-02-16';
+DECLARE @EndDT   DATETIME2(7) = '2026-02-23';
+
+SELECT COUNT(*) AS TotalInWindow
+FROM dbo.v_Audit_All
+WHERE event_time >= @StartDT AND event_time < @EndDT;
+
+SELECT COUNT(*) AS SelectsInWindow
+FROM dbo.v_Audit_All
+WHERE event_time >= @StartDT AND event_time < @EndDT
+  AND action_id = 'SL';
 
 
+If TotalInWindow = 0 → base is empty → report blank.
+
+If TotalInWindow > 0 but SelectsInWindow = 0 → SELECT auditing isn’t captured (or action_id differs).
+
+Why “blank email” happens even when things are working
+
+Even if events exist, your email body can still appear blank if:
+
+You’re building HTML but sections only render when there are rows, and all sections are empty
+
+The procedure doesn’t include “No events found” text
+
+FOR XML PATH returns NULL and you don’t print fallback text (common)
+
+✅ Fix: add explicit “No findings this period” blocks so the email is never empty.
+
+Quick Fix (make email never blank)
+
+In your email procedure, add a final safeguard:
+
+IF @html IS NULL OR LEN(@html) < 500
+BEGIN
+    SET @html = N'<h2>Weekly Audit Pack - TERA</h2>'
+              + N'<p>No qualifying audit events were found for this period (or filters excluded all events).</p>';
+END
+
+What I need from you (minimal)
+
+Run this and paste the results:
+
+SELECT TOP (5) event_time, action_id, server_principal_name, database_name, statement
+FROM dbo.v_Audit_All
+ORDER BY event_time DESC;
+
+SELECT TOP (20) action_id, COUNT(*) cnt
+FROM dbo.v_Audit_All
+WHERE event_time >= DATEADD(DAY,-7, SYSUTCDATETIME())
+GROUP BY action_id
+ORDER BY cnt DESC;
+
+
+With those two outputs, I can tell you exactly whether it’s normal (no findings) or misconfigured (filters/path/action_ids) and give you the corrected script in one paste.
